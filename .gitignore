@@ -1,0 +1,28 @@
+.env
+.idea
+.venv
+.tok
+.env.prod
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# Testing & Type checking
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Logs
+*.log
+
+# Ipython container profile (history etc.)
+.ipython/
+
+sessions/
+media/

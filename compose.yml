@@ -1,0 +1,151 @@
+services:
+
+  waha:
+    container_name: waha
+    restart: always
+    image: devlikeapro/waha
+
+    logging:
+      driver: 'json-file'
+      options:
+        max-size: '100m'
+        max-file: '10'
+
+    ports:
+      - '3000:3000/tcp'
+
+    networks:
+      - app-network
+
+    volumes:
+      # Store sessions in the .sessions folder (comment it if you're using MongoDB)
+      - './sessions:/app/.sessions'
+
+      # Save media files
+      # https://waha.devlike.pro/docs/how-to/storages/#save-media-files-between-the-container-restarts
+      - './media:/app/.media'
+
+    env_file:
+      - .env
+
+    healthcheck:
+      # /health runs real checks (engine, sessions) — needs X-Api-Key
+      # (/ping is the unauthenticated liveness-only fallback)
+      test: [
+        "CMD-SHELL",
+        "curl -fsS -H \"X-Api-Key: $$WAHA_API_KEY\" http://localhost:3000/health || exit 1",
+      ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+      start_interval: 5s
+
+
+  huey:
+    build:
+      context: .
+    image: wms
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - PYTHONPATH=/app
+    networks:
+      - app-network
+    volumes:
+      - ./modules:/app/modules
+      - ./configs:/app/configs
+      - ./models:/app/models
+      # Persist ipython profile (history.sqlite etc.) across rebuilds.
+      # MUST be listed BEFORE the startup-file mount below, so the file
+      # mount lands on top of the directory mount.
+      - ./.ipython:/app/.ipython
+      - ./modules/ipython_startup.py:/app/.ipython/profile_default/startup/auto_reload.py
+      - ./tasks:/app/tasks
+    command: uv run huey_consumer tasks.huey -k thread -w 1 --flush-locks info
+    healthcheck:
+      test: [
+        "CMD-SHELL",
+        "python -c \"import os,sys; import redis; r=redis.Redis.from_url(os.getenv('REDIS_URL')); sys.exit(0 if r.ping() else 1)\""
+      ]
+      interval: 3m
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+      start_interval: 2s
+
+#  app:
+#    build:
+#      context: .
+#    image: morning-mailer
+#    restart: unless-stopped
+#    env_file:
+#      - .env
+#    environment:
+#      - PYTHONPATH=/app
+#      - PYTHONFAULTHANDLER=1
+#      - GAI_CONFIG=prefer-ipv4
+#    networks:
+#      - app-network
+#    dns:
+#      - 8.8.8.8
+#      - 8.8.4.4
+#      - 1.1.1.1
+#    extra_hosts:
+#      - host.docker.internal:host-gateway
+#    ports:
+#      - '${ADMIN_PORT:-8000}:8000'
+#    volumes:
+#      - ./admin:/app/admin
+#      - ./modules:/app/modules
+#      - ./modules/ipython_startup.py:/app/.ipython/profile_default/startup/auto_reload.py
+#      - ./cli_users.py:/app/cli_users.py
+#      - ./tasks.py:/app/tasks.py
+#      - ./gauth:/app/gauth
+#      - ./google_auth:/app/google_auth
+#      - ./users.json:/app/users.json
+#    command: uvicorn admin.main:app --host 0.0.0.0 --port 8000 --reload --proxy-headers --workers 1 --use-colors --log-level debug
+#    depends_on:
+#      valkey:
+#        condition: service_healthy
+#      huey:
+#        condition: service_healthy
+#    healthcheck:
+#      test: [ "CMD-SHELL", "python -c \"import urllib.request,json; r=urllib.request.urlopen('http://localhost:8000/health',timeout=5); exit(0 if r.status==200 else 1)\"" ]
+#      interval: 30m
+#      timeout: 10s
+#      retries: 3
+#      start_period: 30s
+#      start_interval: 5s
+
+#  dozzle-agent:
+#    image: amir20/dozzle:latest
+#    container_name: dozzle-agent
+#    restart: unless-stopped
+#    command: agent
+#    volumes:
+#      - /var/run/docker.sock:/var/run/docker.sock:ro
+#    ports:
+#      - "7007:7007" # The default port for Dozzle agents
+#    networks:
+#      - app-network
+#    environment:
+#      - DOZZLE_HOSTNAME=Morning-Mailer
+#      - DOZZLE_LEVEL=info
+#    #      - DOZZLE_FILTER=label=titan-brain
+#    healthcheck:
+#      test: [ "CMD", "/dozzle", "healthcheck" ]
+#      interval: 30s
+#      retries: 5
+#      start_period: 5s
+#      start_interval: 2s
+
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+  redis-data:
+  valkey_data: {}
+#  dozzle_data:

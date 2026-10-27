@@ -1,0 +1,101 @@
+"""
+Application settings — single source of truth for all configuration.
+
+Resolution order (highest priority wins):
+    1. Real environment variables (Docker -e, shell export)
+    2. .env file (absolute path — independent of process CWD)
+    3. Field defaults
+
+.env keys are matched case-insensitively against field names,
+including the env_prefix, e.g.:
+    WAHA_API_URL / WAHA_API_KEY / WAHA_SESSION / WAHA_DEFAULT_COUNTRY_CODE
+    API_DEBUG / API_PORT / API_HOST
+"""
+
+from functools import lru_cache
+from pathlib import Path
+from typing import Optional
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Repo root = parent of configs/ — makes .env lookup CWD-independent
+# (works from anywhere: uv scripts, Docker WORKDIR, huey workers, tests)
+BASE_DIR = Path(__file__).resolve().parent.parent
+ENV_FILE = BASE_DIR / ".env"
+
+
+class RedisSettings(BaseSettings):
+    redis_url: str = "redis://localhost:6379/0"
+
+    model_config = SettingsConfigDict(env_file=ENV_FILE, extra="ignore")
+
+
+class WASettings(BaseSettings):
+    # Field name is api_url (NOT base_url) on purpose:
+    #   WAHA_API_URL  = how THIS app reaches the WAHA container
+    #                   (http://waha:3000 inside Docker, http://localhost:3000 locally)
+    #   WAHA_BASE_URL = consumed by the WAHA container itself (public URL for
+    #                   webhooks / file URLs) — do NOT read it here.
+    # This mirrors modules/wa_util.py WhatsAppClientConfig.from_env()
+    # which also prefers WAHA_API_URL.
+    api_url: str = "http://localhost:3000"
+    api_key: Optional[str] = None
+    session: str = "default"
+    default_country_code: str = "91"
+
+    # env_prefix means .env keys are WAHA_API_URL, WAHA_API_KEY, etc.
+    model_config = SettingsConfigDict(
+        env_prefix="waha_", env_file=ENV_FILE, extra="ignore"
+    )
+
+
+class FastAPISettings(BaseSettings):
+    debug: bool = False
+    port: int = 8000
+    host: str = "0.0.0.0"
+
+    # .env keys: API_DEBUG, API_PORT, API_HOST
+    model_config = SettingsConfigDict(
+        env_prefix="api_", env_file=ENV_FILE, extra="ignore"
+    )
+
+
+class TaskSettings(BaseSettings):
+    retry_count: int = 2
+    delay: int = 60
+
+    model_config = SettingsConfigDict(env_file=ENV_FILE, extra="ignore")
+
+class RedisKeys(BaseSettings):
+    huey_task_tracker: str = "HUEY_TASK_TRACKER"
+
+    model_config = SettingsConfigDict(env_file=ENV_FILE, extra="ignore")
+
+
+class Settings(BaseSettings):
+    """Aggregated settings — access as settings.redis.redis_url, etc."""
+
+    redis: RedisSettings = RedisSettings()
+    waha: WASettings = WASettings()
+    api: FastAPISettings = FastAPISettings()
+    task: TaskSettings = TaskSettings()
+    redis_keys: RedisKeys = RedisKeys()
+
+    model_config = SettingsConfigDict(env_file=ENV_FILE, extra="ignore")
+
+
+
+
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    """
+    Cached settings accessor — call this everywhere instead of
+    constructing Settings() repeatedly (each construction re-reads
+    .env and re-validates).
+
+    In FastAPI, build a dependency:
+
+        def settings_dep() -> Settings:
+            return get_settings()
+    """
+    return Settings()

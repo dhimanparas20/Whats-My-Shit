@@ -1,0 +1,61 @@
+# ──────────────────────────────────────────────
+# Secrets — NEVER enter the build context
+# ──────────────────────────────────────────────
+.env
+.env.*
+!.env.sample
+
+# ──────────────────────────────────────────────
+# Runtime data (volumes provide these in containers)
+# ──────────────────────────────────────────────
+# WAHA sessions — 123MB, CONTAINS WHATSAPP AUTH CREDENTIALS
+sessions/
+media/
+
+# IPython profile (history.sqlite etc.) — mounted via compose
+.ipython/
+
+# Logs / caches
+*.log
+logs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ──────────────────────────────────────────────
+# Python junk
+# ──────────────────────────────────────────────
+# Local venv (68MB) — the image builds its own via uv
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+.python-version
+
+# ──────────────────────────────────────────────
+# Tooling / editors / git
+# ──────────────────────────────────────────────
+.git/
+.gitignore
+.idea/
+.vscode/
+.tok/
+AGENTS.md
+CLAUDE.md
+
+# Docker / compose files themselves (not needed in image)
+Dockerfile
+docker-compose*.yml
+compose.yml
+compose.override.yml
+
+# Docs
+README.md
+
+# Everything else isn't needed — but keep allowed:
+# KEEP: modules/, configs/, tasks/, api/, models/, pyproject.toml, uv.lock
