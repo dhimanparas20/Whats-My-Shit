@@ -171,6 +171,12 @@ All external connections are built here. **Rules:**
 - `HUEY_TASK_TRACKER` prefix — `TaskStatus` records (§7).
 - `OTP:<country_code><phone>` prefix (one STRING per phone, `TaskSettings`-independent
   per-key TTL) — `OTPData` records (§7).
+- `USER:<user_id>` HASH — user records (uuid7, no TTL) + O(1) indexes
+  `USER:EMAIL:<sha256(email)>` / `USER:APIKEY:<sha256(api_key)>` STRING maps
+  (PII/keys never in key names, never SCAN'd — §5a).
+- `QUOTA:<DAILY|MONTHLY>:<user_id>` STRING — `QuotaUsage` JSON (window FIRST,
+  so `SCAN QUOTA:DAILY:*` = everyone's daily usage), TTL anchored
+  to each window's end (§5a QuotaService).
 - `WMS:*` namespaces reserved for future use (idempotency).
 - CONVENTION: all new Redis keys use `UPPER_SNAKE` or `WMS:<SUB>:<ID>` prefixes,
   IDs are UUID4 from huey/str(uuid4).
@@ -195,6 +201,7 @@ import from `services` re-exports, never tasks/api cycles.
 |---|---|---|
 | `services/otp.py` | `OTPService` (singleton `otp_service`) | `generate(phone, length?, ttl?)` → `(plaintext, OTPData)`; `save(record, phone, country_code?)`; `get(phone, country_code?)` → `OTPData\|None`; `delete(...)`; **`verify_otp(phone, code, country_code?)` — classmethod** (routes through the singleton's store/settings, overridable; callable as `OTPService.verify_otp(...)`, `otp_service.verify_otp(...)`, or flat `verify_otp` alias). Owns: pepper (warn-once), `OTP:<cc><phone>` keying, one-active-code-per-phone, attempt counting/lockout, expiry reclaim |
 | `services/user.py` | `UserService` (singleton `user_service`) | Storage: `USER:<user_id>` HASH (uuid7, no TTL) + O(1) indexes `USER:EMAIL:<sha256(email)>` and `USER:APIKEY:<sha256(api_key)>` (STRING maps — PII/keys never in key names, never SCAN'd). API: `create(full_name, email, password, webhook_url?, extra_info?)` → `(User, plaintext_api_key)` — dup email raises, plaintext shown ONCE, only sha256 persisted; `get(id)`; `find_by_email(email)`; `authenticate_api_key(key)` (respects `is_active`); `authenticate(email, password)` (bcrypt `verify_password`); `update(id, **fields)` — whitelist `full_name/webhook_url/is_active/extra_info` only, stamps `updated_at`, raises on credential fields; `update_password(id, new)` — no old password required = forgot-password/reset primitive (API layer verifies identity via OTP/token first); `rotate_api_key(id)` → `(User, plaintext)` (old key dies instantly, index killed via stored hash — no plaintext needed); `delete(id)` (hard — indexes cleaned). Passwords = bcrypt; api keys = sha256 (see §11 pitfall 18) |
+| `services/quota.py` | `QuotaService` (singleton `quota_service`) | Storage: `QUOTA:<DAILY\|MONTHLY>:<user_id>` STRING (QuotaUsage JSON — window FIRST: `SCAN QUOTA:DAILY:*` = all daily records), TTL = window end (IST midnight / month start) + 60s buffer — **lazy reset via expiry**, `window_end` field is the authority for the race window. Tracking unit = user/api key (NOT phone). API: `get_or_create(user_id, window, messages_limit?, otp_limit?)`; `check(user_id, message_type)` — pre-send gate for the API layer (BOTH windows must allow; returns `{allowed, reason, daily, monthly}` usage dicts, no mutation); `increment(user_id, message_type, amount=1)` — call ONLY after successful WAHA send (failed sends never consume quota), bumps BOTH windows, stamps **per-type** first/last (`first_message_sent_at`/`last_message_sent_at` vs `first_otp_sent_at`/`last_otp_sent_at`); `set_limits(user_id, messages?, otps?, window?)` — per-user caps, `window=None` = both; `reset(user_id, window)` / `delete(...)`; lazy-expired reads return None → treated as fresh window. Default caps: 1000/100 daily, 10000/1000 monthly (service constants) |
 
 ## §5b. Module Reference (`modules/`)
 
@@ -242,8 +249,8 @@ import from `services` re-exports, never tasks/api cycles.
   `status` (OTPStatus, default PENDING), `attempts`, `retry_count`,
   `ttl`, `expiry` (auto = timestamp+ttl via model_validator), `extra_info`.
   Instance helpers: `remaining_ttl()`, `is_expired()` (note: NOT a classmethod).
-- `models/enums.py` — domain enums `OTPStatus` (pending/verified/expired/failed)
-  and `WhatsappMessageType` (text/otp). **Enums live in models, NOT configs** —
+- `models/enums.py` — domain enums `OTPStatus` (pending/verified/expired/failed),
+  `WhatsappMessageType` (text/otp), `QuotaWindow` (daily/monthly). **Enums live in models, NOT configs** —
   configs must never import from models (layering), so never resurrect
   `configs/enums.py`.
 - `User` (models/user.py) — API consumer record (Phase 5 groundwork).
@@ -254,6 +261,18 @@ import from `services` re-exports, never tasks/api cycles.
   shown once at create/rotate), `password_hash` (bcrypt — one-way, NOT
   reversible encryption), `created_at`/`updated_at` (floats),
   `is_active` (soft-disable), `extra_info`.
+- `QuotaUsage` (models/quota.py) — per-user usage snapshot per window.
+  Fields: `user_id`, `window` (QuotaWindow DAILY|MONTHLY), `messages_sent`,
+  `otp_sent` (counted SEPARATELY), `messages_limit`/`otp_limit`
+  (caps denormalized INTO the record — one read per window for a check),
+  `first_message_sent_at`/`last_message_sent_at`,
+  `first_otp_sent_at`/`last_otp_sent_at` (epoch — SEPARATE per type:
+  OTP vs message sends happen at different times), `window_start`/`window_end`
+  (epoch — window_end is the reset authority), `extra_info`.
+  Helpers: `remaining_messages()`, `remaining_otp()`,
+  `allows(message_type)`, `usage(message_type)` (API-response view).
+  ONE model, TWO keys (DAILY + MONTHLY) — different reset boundaries
+  make one-key-per-window the clean design (TTL = lazy reset).
 - `WAHASendResult` (models/waha.py) — normalized WAHA send response
   (`resp['_data']`): fields `from_` (alias `"from"` — reserved keyword),
   `to`, `viewed`, `id` (str OR dict-with-`_serialized`). Build via
@@ -459,6 +478,10 @@ Completed so far:
 - **`UserService`** (`services/user.py`) — user accounts (uuid7 HASH records
   under `USER:`), bcrypt passwords, `wms_`-prefixed API keys with O(1)
   sha256-index auth lookups, rotation, soft-disable, delete.
+- **`QuotaService`** (`services/quota.py`) — per-user daily/monthly caps for
+  messages vs OTPs (STRING records under `QUOTA:`, TTL lazy reset at each
+  window's IST boundary), `check()` pre-send gate + `increment()` on
+  successful send, `set_limits` per user.
 - `models/` layer with `TaskStatus`, `OTPData`, and domain enums
   (`OTPStatus`, `WhatsappMessageType`).
 - **Phase 2 partially done**: send + store + verify_otp backend flow.

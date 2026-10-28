@@ -76,6 +76,10 @@ marketing blasts.
   create/rotation) with O(1) hashed-index lookups (ready for `X-Api-Key`
   auth), key rotation, password reset (forgot-password primitive),
   soft-disable (`is_active`), and clean deletes
+- ✅ **Quota service** — per-user daily + monthly caps for WhatsApp messages
+  and OTPs (counted separately): `check()` pre-send gate (429 at API layer),
+  `increment()` on successful send, per-user limit overrides, IST-midnight /
+  month-end TTL lazy resets
 - ✅ **Task tracker** — every task records its terminal state
   (`TaskStatus` JSON) to Redis under `HUEY_TASK_TRACKER:<job_id>`; survives
   result-TTL expiry and is readable without touching Huey's pickle store
@@ -166,7 +170,8 @@ case-insensitively against `configs/config.py` field names + prefixes.
 | `OTP_MAX_VERIFY_ATTEMPTS` | `5` | `verify_otp` | Wrong-code tries before lockout |
 | `HUEY_TASK_TRACKER` | `HUEY_TASK_TRACKER` | tasks | Redis key prefix for task-status records |
 | `OTP` | `OTP` | OTP service | Redis key prefix for OTP records (`OTP:<cc><phone>`) |
-| `USER` | `USER` | user service | Redis key prefix for user records + indexes |
+| `USERS` | `USER` | user service | Redis key prefix for user records + indexes (env var is `USERS` — `USER` collides with the POSIX login-name env var) |
+| `QUOTA` | `QUOTA` | quota service | Redis key prefix for usage records (`QUOTA:<DAILY\|MONTHLY>:<user_id>` — window first) |
 | `LOG_LEVEL` | `DEBUG` | logger | stdlib levels |
 | `LOG_FORMAT` | `json` | logger | `json` or pretty |
 

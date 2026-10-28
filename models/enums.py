@@ -19,6 +19,13 @@ class OTPStatus(str, Enum):
     FAILED = "failed"  # exhausted verify attempts / abandoned
 
 
+class QuotaWindow(str, Enum):
+    """Usage-tracking window for quota caps."""
+
+    DAILY = "daily"
+    MONTHLY = "monthly"
+
+
 class WhatsappMessageType(str, Enum):
     """Kind of WhatsApp message a task delivered."""
 

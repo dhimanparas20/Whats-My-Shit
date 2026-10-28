@@ -84,7 +84,9 @@ class RedisKeys(BaseSettings):
     # Named `users` (NOT `user`): a prefix-less `user` field would match the
     # standard POSIX $USER env var (login name) → keys differed per machine.
     # Env key is USERS; the VALUE is the Redis key prefix (USER:<user_id>).
-    users: str = "USERS"
+    users: str = "USER"
+    # POSIX-safe: no standard env var named QUOTA exists.
+    quota: str = "QUOTA"
 
     model_config = SettingsConfigDict(env_file=ENV_FILE, extra="ignore")
 
@@ -97,7 +99,9 @@ class Settings(BaseSettings):
     api: FastAPISettings = FastAPISettings()
     task: TaskSettings = TaskSettings()
     otp: OTPSettings = OTPSettings()
-    redis_keys: RedisKeys = RedisKeys()
+    redis_keys: RedisKeys = RedisKeys()  # users → "USER" (POSIX $USER collision renamed)
+    # ^ RedisKeys.users → "USER" (renamed from `user`: POSIX $USER collision)
+    # ^ RedisKeys.quota → "QUOTA" (quota tracking prefix — see services/quota.py)
 
     model_config = SettingsConfigDict(env_file=ENV_FILE, extra="ignore")
 
