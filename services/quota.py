@@ -59,13 +59,16 @@ class QuotaService:
     # ── keying ──────────────────────────────────────────────────────
 
     @staticmethod
-    def _key(user_id: str, window: QuotaWindow) -> str:
+    @staticmethod
+    def _key(user_id: str, window: QuotaWindow | str) -> str:
         """
         Bare (pre-prefix) key, window FIRST:
         ``DAILY:<user_id>`` / ``MONTHLY:<user_id>`` — so every quota of a
         kind sits under one scannable namespace (``SCAN QUOTA:DAILY:*``).
+        Accepts a raw ``"daily"``/``"monthly"`` string too.
         """
-        return f"{window.value.upper()}:{user_id}"
+        w = QuotaWindow(window) if isinstance(window, str) else window
+        return f"{w.value.upper()}:{user_id}"
 
     # ── window math ─────────────────────────────────────────────────
 

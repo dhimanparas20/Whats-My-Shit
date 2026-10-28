@@ -199,8 +199,9 @@ import from `services` re-exports, never tasks/api cycles.
 
 | File | Service | Key API |
 |---|---|---|
-| `services/otp.py` | `OTPService` (singleton `otp_service`) | `generate(phone, length?, ttl?)` → `(plaintext, OTPData)`; `save(record, phone, country_code?)`; `get(phone, country_code?)` → `OTPData\|None`; `delete(...)`; **`verify_otp(phone, code, country_code?)` — classmethod** (routes through the singleton's store/settings, overridable; callable as `OTPService.verify_otp(...)`, `otp_service.verify_otp(...)`, or flat `verify_otp` alias). Owns: pepper (warn-once), `OTP:<cc><phone>` keying, one-active-code-per-phone, attempt counting/lockout, expiry reclaim |
+| `services/otp.py` | `OTPService` (singleton `otp_service`) | `generate(phone, length?, ttl?)` → `(plaintext, OTPData)`; `save(record, user_id, country_code?)`; `get(user_id, phone, country_code?)` → `OTPData\|None`; `delete(user_id, phone, ...)`; **`verify_otp(user_id, phone, code, country_code?)` — classmethod** (routes through the singleton's store/settings, overridable; callable as `OTPService.verify_otp(...)`, `otp_service.verify_otp(...)`, or flat `verify_otp` alias). Keys are user-scoped: `OTP:<user_id>:<cc><phone>` — different users hold independent codes for the same phone. Owns: pepper (warn-once), one-active-code-per-(user,phone), attempt counting/lockout, expiry reclaim |
 | `services/user.py` | `UserService` (singleton `user_service`) | Storage: `USER:<user_id>` HASH (uuid7, no TTL) + O(1) indexes `USER:EMAIL:<sha256(email)>` and `USER:APIKEY:<sha256(api_key)>` (STRING maps — PII/keys never in key names, never SCAN'd). API: `create(full_name, email, password, webhook_url?, extra_info?)` → `(User, plaintext_api_key)` — dup email raises, plaintext shown ONCE, only sha256 persisted; `get(id)`; `find_by_email(email)`; `authenticate_api_key(key)` (respects `is_active`); `authenticate(email, password)` (bcrypt `verify_password`); `update(id, **fields)` — whitelist `full_name/webhook_url/is_active/extra_info` only, stamps `updated_at`, raises on credential fields; `update_password(id, new)` — no old password required = forgot-password/reset primitive (API layer verifies identity via OTP/token first); `rotate_api_key(id)` → `(User, plaintext)` (old key dies instantly, index killed via stored hash — no plaintext needed); `delete(id)` (hard — indexes cleaned). Passwords = bcrypt; api keys = sha256 (see §11 pitfall 18) |
+| `services/tracking.py` | (module, no singleton) | The ONLY writer of the task tracker + the quota gate. Exports: `task_tracker` (shared `RedisStringUtil`), `tracker_key(user_id, job_id)` (→ `HUEY_TASK_TRACKER:<user_id>:<job_id>`), `write_status(user_id, job_id, status)`, **`quota_gate(user_id, message_type, job_id, task)`** — checks quota, and when blocked: builds the terminal `quota_blocked` TaskStatus, writes it, returns it (task must `return` it — NO raise); returns `None` when allowed. `get_job_status` (in tasks/tasks.py) reads through it. Direct `task_tracker.set` outside this module is a violation |
 | `services/quota.py` | `QuotaService` (singleton `quota_service`) | Storage: `QUOTA:<DAILY\|MONTHLY>:<user_id>` STRING (QuotaUsage JSON — window FIRST: `SCAN QUOTA:DAILY:*` = all daily records), TTL = window end (IST midnight / month start) + 60s buffer — **lazy reset via expiry**, `window_end` field is the authority for the race window. Tracking unit = user/api key (NOT phone). API: `get_or_create(user_id, window, messages_limit?, otp_limit?)`; `check(user_id, message_type)` — pre-send gate for the API layer (BOTH windows must allow; returns `{allowed, reason, daily, monthly}` usage dicts, no mutation); `increment(user_id, message_type, amount=1)` — call ONLY after successful WAHA send (failed sends never consume quota), bumps BOTH windows, stamps **per-type** first/last (`first_message_sent_at`/`last_message_sent_at` vs `first_otp_sent_at`/`last_otp_sent_at`); `set_limits(user_id, messages?, otps?, window?)` — per-user caps, `window=None` = both; `reset(user_id, window)` / `delete(...)`; lazy-expired reads return None → treated as fresh window. Default caps: 1000/100 daily, 10000/1000 monthly (service constants) |
 
 ## §5b. Module Reference (`modules/`)
@@ -288,43 +289,70 @@ import from `services` re-exports, never tasks/api cycles.
 ## §7. Task Tracker & OTP Patterns (Redis)
 
 **Task tracker:**
-- Redis key: `HUEY_TASK_TRACKER:<job_id>` (one STRING with JSON `TaskStatus`).
+- Redis key: `HUEY_TASK_TRACKER:<user_id>:<job_id>` (one STRING with JSON
+  `TaskStatus` — user-scoped; every send belongs to the user whose API key
+  triggered it, and `get_job_status(user_id, job_id)` reflects that).
 - Written by the task itself just before returning/re-raising, so it only
   reflects terminal states; pending/queued lookup falls back to huey.
-- `get_job_status()` (`tasks/tasks.py`) resolution order:
-  1. `task_tracker.get(job_id)` → success/failed + rich data
+- `get_job_status(user_id, job_id)` (`tasks/tasks.py`) resolution order:
+  1. `task_tracker.get(f"{user_id}:{job_id}")` → success/failed + rich data
   2. `huey.result(job_id, preserve=True)` → finished
-  3. `huey.storage.peek_data(job_id)` (truthy ⇒ pending/queued/retry schedule)
+  3. `huey.storage.peek_data(job_id)` (truthy ⇒ pending/queued/retry
+     schedule — **but compare against `EmptyData`**: for unknown ids it
+     returns the `EmptyData` CLASS, which is truthy — see §11 #20)
   4. else `not_found`
 - Always mutate via `task_tracker.set(... overwrite=True)` — retries re-run the
   same job_id and must overwrite the previous attempt's entry.
 
 **OTP (Phase 2 core, implemented — logic lives in `services/otp.py`):**
-- Redis key: `OTP:<country_code><phone>` (e.g. `OTP:919876543210`) — one
-  ACTIVE code per phone; retries and re-requests overwrite with
-  `overwrite=True` and an explicit per-key `ttl=otp_ttl` (never the caller's
-  12h store default).
+- Redis key: `OTP:<user_id>:<country_code><phone>` — OWNERSHIP IS KEY-SCOPED
+  (user_id lives in the KEY, not as a model field): different users can hold
+  independent active codes for the SAME phone, tracked separately
+- Redis key: `OTP:<user_id>:<country_code><phone>` — OWNERSHIP IS KEY-SCOPED
+  (user_id lives in the KEY, not as a model field): different users can hold
+  independent active codes for the SAME phone, tracked separately
+  (`verify_otp(user_id, phone, code)`). One ACTIVE code per (user, phone);
+  retries and re-requests overwrite with `overwrite=True` and an explicit
+  per-key `ttl=otp_ttl` (never the caller's 12h store default).
 - `OTPService.generate(phone, ...)` → `(plaintext, record)`; the task sends
-  via WAHA, then `otp_service.save(record, phone, country_code)` — **the
+  via WAHA, then `otp_service.save(record, user_id, country_code)` — **the
   record persists ONLY after the send succeeds** (a never-delivered code must
   never verify). Plaintext code: never logged, never stored.
-- `verify_otp(phone, code)` — classmethod on `OTPService` (services/otp.py,
-  flat alias re-exported from tasks for compat): resolution order not_found →
-  terminal (verified/failed) → expired (deletes record) → attempts exhausted
-  (locks, status FAILED) → HMAC-compare via `hmac.compare_digest` →
-  success / wrong_code (+attempts). Every mutation rewrite re-claims the
-  remaining TTL so records cannot outlive expiry.
+- `verify_otp(user_id, phone, code)` — classmethod on `OTPService`
+  (services/otp.py, flat alias re-exported from tasks for compat): resolution
+  order not_found → terminal (verified/failed) → expired (deletes record) →
+  attempts exhausted (locks, status FAILED) → HMAC-compare via
+  `hmac.compare_digest` → success / wrong_code (+attempts). **A wrong code
+  that ALSO reaches the cap returns `"failed"` (not `"wrong_code"`) — the
+  caller sees the terminal state.** Every mutation rewrite re-claims the
+  remaining TTL (floor of 1s — NEVER the 12h store default; a dying record
+  must not be resurrected).
 - `TaskStatus.extra_info` carries `otp_id` (uuid7) — never the code.
 - **Not yet built (next up in Phase 2):** resend cooldown/rate limiting,
   verify endpoint in `api/`.
 
 ## §8. Huey Rules
 
-- **Tasks stay THIN**: send via WAHA → write TaskStatus → raise on failure.
-  ALL domain logic (generation, storage rules, state machines, multi-store
-  flows) belongs in `services/` — import as
+- **Tasks stay THIN**: quota gate → send via WAHA → write TaskStatus →
+  raise on failure. ALL domain logic (generation, storage rules, state
+  machines, multi-store flows) belongs in `services/` — import as
   `from services.otp import otp_service`. Services must NEVER import tasks
   (import cycles); tasks import services downward.
+- **Every task takes `user_id` as its FIRST param** — the triggerer of the
+  send (resolved from the API key at the future API layer). It scopes the
+  tracker key (`HUEY_TASK_TRACKER:<user_id>:<job_id>`) and the OTP key
+  (`OTP:<user_id>:<cc><phone>`). EXCEPTION: `send_fire_and_forget` is the
+  untracked dev utility (no user/quota/tracker).
+- **Quota gate contract** (for send tasks): `quota_gate(user_id, type,
+  job_id, task)` from `services/tracking.py` runs `quota_service.check`
+  BEFORE the send — over-limit sends are recorded as terminal
+  `quota_blocked` failures and RETURN (no raise — a retry cannot fix a
+  quota, raising would just burn retries and re-run the same blocked send).
+  `quota_service.increment(user_id, type)` AFTER a successful send ONLY —
+  failed attempts never consume quota, so a retry that finally succeeds
+  counts exactly once. Wrap the post-success increment in try/except and
+  LOG (never re-raise) — the message is already delivered; requeueing
+  would double-send.
 - ONE Huey instance per process: `huey = RedisHuey("wms-huey", url=..., utc=False)`
   in `tasks/tasks.py`. Import chain: consumer imports `tasks.huey` →
   `tasks/__init__.py` re-exports `huey, send_whatsapp_message, get_job_status`
@@ -439,6 +467,22 @@ import from `services` re-exports, never tasks/api cycles.
     keys silently became `PARAS:…` and would have DIFFERED in containers
     (`USER` unset → default). Renamed to `users` (env `USERS`). The danger
     set: `user`, `path`, `home`, `shell`, `pwd`, `tmpdir`, `lang`, `term`.
+20. `huey.storage.peek_data()` returns the `EmptyData` CLASS (not an
+    instance, still truthy) for unknown ids — checking `if task_data:`
+    marks every unknown job_id as "pending". Always compare
+    `task_data is not EmptyData` (import from `huey.constants`), the same
+    identity check huey's own storage code uses.
+21. CALLING a huey task function directly (`send_x(...)`) ENQUEUES it to the
+    REAL Redis queue for the consumer to run — it does not run locally.
+    For in-process test execution use `.s(...).execute()` (builds the task
+    instance without enqueueing, runs it inline). A direct call with a
+    stubbed `get_waha` in YOUR process does not protect the container's
+    real consumer, which runs the REAL code with REAL WAHA access.
+    (Live example: a direct-call test enqueued a fire-and-forget send; the
+    consumer executed it against REAL WAHA — the fake number failed with
+    `500 No LID for user` so nothing was delivered, but by pure luck. NEVER
+    call task functions directly except in throwaway sanity checks; in
+    tests always use `.s(...).execute()`.)
 
 ## §12. Testing / sanity commands used in this codebase
 

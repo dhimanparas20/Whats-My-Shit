@@ -44,15 +44,19 @@ class OTPService:
         )
         self._pepper_warned = False
 
-    # ── keying ──────────────────────────────────────────────────────
-
     @staticmethod
-    def record_key(phone: str, country_code: str = "91") -> str:
+    def record_key(
+        user_id: str, phone: str, country_code: str = "91"
+    ) -> str:
         """
-        Bare (pre-prefix) Redis key for a phone's active OTP record:
-        ``OTP:<country_code><phone>`` → e.g. ``OTP:919876543210``.
+        Bare (pre-prefix) Redis key for a user's active OTP record:
+        ``<user_id>:<country_code><phone>`` → full key ``OTP:<user_id>:91<phone>``.
+
+        User id comes FIRST in the key — two users can each hold an active
+        code for the SAME phone number, tracked independently (key-scoped
+        ownership; user_id is intentionally NOT a model field).
         """
-        return f"{country_code}{phone}"
+        return f"{user_id}:{country_code}{phone}"
 
     # ── crypto ──────────────────────────────────────────────────────
 
@@ -106,39 +110,45 @@ class OTPService:
 
     # ── persistence ─────────────────────────────────────────────────
 
-    def save(self, record: OTPData, phone: str, country_code: str = "91") -> None:
+    def save(
+        self, record: OTPData, user_id: str, country_code: str = "91"
+    ) -> None:
         """
-        Persist a record as the phone's ACTIVE code.
+        Persist a record as the user's ACTIVE code for that phone.
 
-        One active code per phone: retries and re-requests overwrite the
-        same key (overwrite=True) with an explicit per-key TTL — never the
-        store's 12h backstop.
+        One active code per (user, phone): retries and re-requests overwrite
+        the same key (overwrite=True) with an explicit per-key TTL — never
+        the store's 12h backstop. ``record.phone`` must already be set.
         """
-        record.phone = phone
         self.store.set(
-            self.record_key(phone, country_code),
+            self.record_key(user_id, record.phone, country_code),
             record.model_dump_json(),
             ttl=record.ttl,
             overwrite=True,
         )
 
-    def get(self, phone: str, country_code: str = "91") -> OTPData | None:
-        """Load the phone's active record, or None when absent/expired."""
-        rec = self.store.get(self.record_key(phone, country_code))
+    def get(self, user_id: str, phone: str, country_code: str = "91") -> OTPData | None:
+        """Load the (user, phone) active record, or None when absent/expired."""
+        rec = self.store.get(self.record_key(user_id, phone, country_code))
         return OTPData(**rec) if rec else None
 
-    def delete(self, phone: str, country_code: str = "91") -> None:
-        """Drop the phone's active record (e.g. consumed/expired)."""
-        self.store.delete(self.record_key(phone, country_code))
+    def delete(self, user_id: str, phone: str, country_code: str = "91") -> None:
+        """Drop the (user, phone) active record (e.g. consumed/expired)."""
+        self.store.delete(self.record_key(user_id, phone, country_code))
 
     # ── verification ────────────────────────────────────────────────
 
     @classmethod
-    def verify_otp(cls, phone: str, code: str, country_code: str = "91") -> dict:
+    def verify_otp(
+        cls, user_id: str, phone: str, code: str, country_code: str = "91"
+    ) -> dict:
         """
-        Check a code against the phone's active OTP record (sync — the async
-        API layer must not call this on the event loop; wrap it in
+        Check a code against the (user, phone) active OTP record (sync — the
+        async API layer must not call this on the event loop; wrap it in
         run_in_executor/AnyIO.to_thread per AGENTS §10).
+
+        Ownership is key-scoped: ``OTP:<user_id>:<cc><phone>`` — the same
+        phone can have independent active codes for different users.
 
         Resolution order:
             1. No record           → not_found
@@ -157,12 +167,14 @@ class OTPService:
         ``otp_service.verify_otp(...)`` or the flat ``verify_otp`` alias.
         """
         svc = otp_service
-        key = svc.record_key(phone, country_code)
-        record = svc.get(phone, country_code)
+        key = svc.record_key(user_id, phone, country_code)
+        record = svc.get(user_id, phone, country_code)
         if record is None:
             return {"status": "not_found"}
 
-        base_ttl = record.remaining_ttl() or None  # None → default backstop
+        base_ttl = max(record.remaining_ttl(), 1)  # never None → a verify in
+        # the final second must NOT fall back to the 12h store default and
+        # resurrect a dying record (old bug: `remaining_ttl() or None`).
 
         def rewrite(updated: OTPData) -> None:
             svc.store.set(key, updated.model_dump_json(),
@@ -172,7 +184,7 @@ class OTPService:
             return {"status": record.status.value, "attempts": record.attempts}
 
         if record.is_expired():
-            svc.delete(phone, country_code)
+            svc.delete(user_id, phone, country_code)
             return {"status": "expired"}
 
         if record.attempts >= svc.settings.max_verify_attempts:
@@ -188,7 +200,9 @@ class OTPService:
         if hmac_lib.compare_digest(computed, record.hashed_otp):
             record.status = OTPStatus.VERIFIED
             rewrite(record)
-            logger.info(f"OTP verified for phone={phone}, otp_id={record.otp_id}")
+            logger.info(
+                f"OTP verified: user={user_id}, phone={phone}, otp_id={record.otp_id}"
+            )
             return {"status": "success", "otp_id": record.otp_id}
 
         record.attempts += 1
@@ -196,8 +210,12 @@ class OTPService:
             record.status = OTPStatus.FAILED
         rewrite(record)
         logger.info(
-            f"OTP wrong code for phone={phone}, attempts={record.attempts}"
+            f"OTP wrong code: user={user_id}, phone={phone}, attempts={record.attempts}"
         )
+        if record.status is OTPStatus.FAILED:
+            # this wrong code was ALSO the cap-breaking one — caller must see
+            # the terminal state, not "wrong_code" (AGENTS §11 pitfall)
+            return {"status": "failed", "attempts": record.attempts}
         return {"status": "wrong_code", "attempts": record.attempts}
 
 

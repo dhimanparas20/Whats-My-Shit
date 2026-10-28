@@ -51,14 +51,17 @@ class TaskStatus(BaseModel):
 
 class OTPData(BaseModel):
     """
-    Per-phone OTP record, stored under ``OTP:<country_code><phone>`` as JSON.
+    Per-(user, phone) OTP record, stored under
+    ``OTP:<user_id>:<country_code><phone>`` as JSON — ownership is
+    key-scoped (user_id is NOT a model field), so different users can hold
+    independent active codes for the same phone.
 
     Only stored after the WhatsApp send SUCCEEDS — a code the user never
     received must never be verifiable. The code itself is never stored in
     plaintext; it is an HMAC-SHA256 hash keyed by ``OTPSettings.pepper``.
 
-    One active record per phone: retries and re-requests overwrite the
-    same key (latest code wins), so there are no orphan records.
+    One active record per (user, phone): retries and re-requests overwrite
+    the same key (latest code wins), so there are no orphan records.
     """
 
     otp_id: str                       # uuid7, unique per generated code

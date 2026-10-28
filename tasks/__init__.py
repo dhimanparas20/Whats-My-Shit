@@ -2,6 +2,7 @@ from tasks.tasks import (
     huey,
     send_whatsapp_message,
     send_whatsapp_otp,
+    send_fire_and_forget,
     get_job_status,
 )
 # verify_otp's LOGIC lives in services/otp.py (AGENTS.md §2); re-exported
@@ -12,6 +13,7 @@ __all__ = [
     "huey",
     "send_whatsapp_message",
     "send_whatsapp_otp",
+    "send_fire_and_forget",
     "verify_otp",
     "get_job_status",
 ]

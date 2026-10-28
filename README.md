@@ -64,22 +64,30 @@ marketing blasts.
 ## Current features
 
 - ✅ **WhatsApp send pipeline** — `send_whatsapp_message` Huey task wrapping
-  WAHA's `/sendText`, with configurable retries (`2` attempts / `60s` delay)
+  WAHA's `/sendText`, with configurable retries (`2` attempts / `60s` delay);
+  quota-gated before send (blocks are terminal, no retry burn) and counted
+  after success
 - ✅ **WhatsApp OTP flow (Phase 2 core)** — `send_whatsapp_otp`: cryptographically
   random code, HMAC-SHA256-hashed with an `OTP_PEPPER` secret (plaintext never
-  stored or logged), one active code per phone (`OTP:<country_code><phone>`),
-  per-key TTL, and `verify_otp()` with attempt counting, expiry handling and
-  lockout after `OTP_MAX_VERIFY_ATTEMPTS` wrong tries
+  stored or logged), one active code per user+phone
+  (`OTP:<user_id>:<cc><phone>`), per-key TTL, and `verify_otp(user_id, …)`
+  with attempt counting, expiry handling and lockout after
+  `OTP_MAX_VERIFY_ATTEMPTS` wrong tries — same phone, multiple users =
+  independent codes
 - ✅ **User service (Phase 5 groundwork)** — `UserService`: registration with
   duplicate-email protection, bcrypt-hashed passwords, `wms_`-prefixed API
   keys **stored only as sha256 hashes** (plaintext shown once at
   create/rotation) with O(1) hashed-index lookups (ready for `X-Api-Key`
   auth), key rotation, password reset (forgot-password primitive),
   soft-disable (`is_active`), and clean deletes
-- ✅ **Quota service** — per-user daily + monthly caps for WhatsApp messages
-  and OTPs (counted separately): `check()` pre-send gate (429 at API layer),
-  `increment()` on successful send, per-user limit overrides, IST-midnight /
-  month-end TTL lazy resets
+- ✅ **Fire-and-forget send** — `send_fire_and_forget(phone, message)` utility
+  task for UI developers testing from the IPython shell: no user, no quota,
+  no tracking — just send and get the normalized WAHA response back
+- ✅ **Quota service (integrated)** — `check()` runs inside every send task
+  BEFORE the send (over-limit = terminal block, no retry burn), and
+  `increment()` only after successful delivery — failed sends never consume
+  quota. Per-user daily + monthly caps for messages and OTPs (counted
+  separately), per-user limit overrides via `set_limits()`
 - ✅ **Task tracker** — every task records its terminal state
   (`TaskStatus` JSON) to Redis under `HUEY_TASK_TRACKER:<job_id>`; survives
   result-TTL expiry and is readable without touching Huey's pickle store
@@ -138,10 +146,11 @@ ipython                    # `r` = connected redis client, autoreload on
 ```python
 from tasks import send_whatsapp_message, get_job_status
 
-result = send_whatsapp_message("91XXXXXXXXXX", "Hello from WMS!")
+# user_id first — the triggerer (from the API key in Phase 1)
+result = send_whatsapp_message(user_id, "91XXXXXXXXXX", "Hello from WMS!")
 job_id = result.task.id
 
-get_job_status(job_id)
+get_job_status(user_id, job_id)
 # {'status': 'success', 'data': {'job_id': ..., 'success': True,
 #   'result': {'from': ..., 'to': ..., 'id': ...}, ...}}
 ```
