@@ -201,8 +201,8 @@ import from `services` re-exports, never tasks/api cycles.
 |---|---|---|
 | `services/otp.py` | `OTPService` (singleton `otp_service`) | `generate(phone, length?, ttl?)` → `(plaintext, OTPData)`; `save(record, user_id, country_code?)`; `get(user_id, phone, country_code?)` → `OTPData\|None`; `delete(user_id, phone, ...)`; **`verify_otp(user_id, phone, code, country_code?)` — classmethod** (routes through the singleton's store/settings, overridable; callable as `OTPService.verify_otp(...)`, `otp_service.verify_otp(...)`, or flat `verify_otp` alias). Keys are user-scoped: `OTP:<user_id>:<cc><phone>` — different users hold independent codes for the same phone. Owns: pepper (warn-once), one-active-code-per-(user,phone), attempt counting/lockout, expiry reclaim |
 | `services/user.py` | `UserService` (singleton `user_service`) | Storage: `USER:<user_id>` HASH (uuid7, no TTL) + O(1) indexes `USER:EMAIL:<sha256(email)>` and `USER:APIKEY:<sha256(api_key)>` (STRING maps — PII/keys never in key names, never SCAN'd). API: `create(full_name, email, password, webhook_url?, extra_info?)` → `(User, plaintext_api_key)` — dup email raises, plaintext shown ONCE, only sha256 persisted; `get(id)`; `find_by_email(email)`; `authenticate_api_key(key)` (respects `is_active`); `authenticate(email, password)` (bcrypt `verify_password`); `update(id, **fields)` — whitelist `full_name/webhook_url/is_active/extra_info` only, stamps `updated_at`, raises on credential fields; `update_password(id, new)` — no old password required = forgot-password/reset primitive (API layer verifies identity via OTP/token first); `rotate_api_key(id)` → `(User, plaintext)` (old key dies instantly, index killed via stored hash — no plaintext needed); `delete(id)` (hard — indexes cleaned). Passwords = bcrypt; api keys = sha256 (see §11 pitfall 18) |
-| `services/tracking.py` | (module, no singleton) | The ONLY writer of the task tracker + the quota gate. Exports: `task_tracker` (shared `RedisStringUtil`), `tracker_key(user_id, job_id)` (→ `HUEY_TASK_TRACKER:<user_id>:<job_id>`), `write_status(user_id, job_id, status)`, **`quota_gate(user_id, message_type, job_id, task)`** — checks quota, and when blocked: builds the terminal `quota_blocked` TaskStatus, writes it, returns it (task must `return` it — NO raise); returns `None` when allowed. `get_job_status` (in tasks/tasks.py) reads through it. Direct `task_tracker.set` outside this module is a violation |
-| `services/quota.py` | `QuotaService` (singleton `quota_service`) | Storage: `QUOTA:<DAILY\|MONTHLY>:<user_id>` STRING (QuotaUsage JSON — window FIRST: `SCAN QUOTA:DAILY:*` = all daily records), TTL = window end (IST midnight / month start) + 60s buffer — **lazy reset via expiry**, `window_end` field is the authority for the race window. Tracking unit = user/api key (NOT phone). API: `get_or_create(user_id, window, messages_limit?, otp_limit?)`; `check(user_id, message_type)` — pre-send gate for the API layer (BOTH windows must allow; returns `{allowed, reason, daily, monthly}` usage dicts, no mutation); `increment(user_id, message_type, amount=1)` — call ONLY after successful WAHA send (failed sends never consume quota), bumps BOTH windows, stamps **per-type** first/last (`first_message_sent_at`/`last_message_sent_at` vs `first_otp_sent_at`/`last_otp_sent_at`); `set_limits(user_id, messages?, otps?, window?)` — per-user caps, `window=None` = both; `reset(user_id, window)` / `delete(...)`; lazy-expired reads return None → treated as fresh window. Default caps: 1000/100 daily, 10000/1000 monthly (service constants) |
+| `services/tracking.py` | (module, no singleton) | The ONLY writer of the task tracker + both quota gates. Exports: `task_tracker` (shared `RedisStringUtil`), `tracker_key(user_id, job_id)` (→ `HUEY_TASK_TRACKER:<user_id>:<job_id>`), `write_status(user_id, job_id, status)`, **`quota_gate(user_id, message_type, job_id, task)`** — per-user gate, **`system_gate(user_id, message_type, job_id, task)`** — SYSTEM super-cap gate (shared `_blocked_and_write` builds the terminal `quota_blocked` TaskStatus with `result.scope = "user"\|"system"` + verdict in `extra_info.quota`, writes it, returns it — task must `return` it, NO raise); gates return `None` when allowed. `get_job_status` (in tasks/tasks.py) reads through it. Direct `task_tracker.set` outside this module is a violation |
+| `services/quota.py` | `QuotaService` (singleton `quota_service`) | Storage: `QUOTA:<DAILY\|MONTHLY>:<subject_id>` STRING (QuotaUsage JSON — window FIRST: `SCAN QUOTA:DAILY:*` = all daily records), TTL = window end (IST midnight / month start) + 60s buffer — **lazy reset via expiry**, `window_end` field is the authority for the race window. Tracking unit = user/api key (NOT phone) + a special `SYSTEM_SUBJECT = "SYSTEM"` record for the super cap. API: `get_or_create(user_id, window, messages_limit?, otp_limit?)` (explicit limits override stored — env cap changes take effect); `check(user_id, message_type)` — per-user pre-send gate (BOTH windows must allow; verdict carries `scope: "user"`); `increment(user_id, message_type, amount=1)` — call ONLY after successful WAHA send, bumps BOTH windows, stamps **per-type** first/last; **`system_gate(message_type)`** — SYSTEM-WIDE daily super-cap verdict (`scope: "system"`, caps from `SystemQuotaSettings`); **`system_increment(message_type, amount=1)`** — bumps the SYSTEM daily counter (same success-only contract); `set_limits(user_id, messages?, otps?, window?)`; `reset/delete`. Default per-user caps: 1000/100 daily, 10000/1000 monthly (service constants); SYSTEM caps: env `SYSTEM_DAILY_MESSAGES` / `SYSTEM_DAILY_OTP` |
 
 ## §5b. Module Reference (`modules/`)
 
@@ -343,16 +343,19 @@ import from `services` re-exports, never tasks/api cycles.
   tracker key (`HUEY_TASK_TRACKER:<user_id>:<job_id>`) and the OTP key
   (`OTP:<user_id>:<cc><phone>`). EXCEPTION: `send_fire_and_forget` is the
   untracked dev utility (no user/quota/tracker).
-- **Quota gate contract** (for send tasks): `quota_gate(user_id, type,
-  job_id, task)` from `services/tracking.py` runs `quota_service.check`
+- **Quota gate contract (TWO-LEVEL)** (for send tasks): after `quota_gate`
+  (per-user), `system_gate(user_id, type, job_id, task)` — also from
+  `services/tracking.py` — checks the SYSTEM-WIDE daily super cap
+  (`QUOTA:DAILY:SYSTEM`, caps from `SYSTEM_DAILY_*` env). Both gates run
   BEFORE the send — over-limit sends are recorded as terminal
   `quota_blocked` failures and RETURN (no raise — a retry cannot fix a
   quota, raising would just burn retries and re-run the same blocked send).
-  `quota_service.increment(user_id, type)` AFTER a successful send ONLY —
-  failed attempts never consume quota, so a retry that finally succeeds
-  counts exactly once. Wrap the post-success increment in try/except and
-  LOG (never re-raise) — the message is already delivered; requeueing
-  would double-send.
+  On SUCCESS: `quota_service.increment(user_id, type)` (user daily+monthly)
+  AND `quota_service.system_increment(type)` (system daily) — BOTH only
+  after a successful send, failed attempts never consume quota, so a retry
+  that finally succeeds counts exactly once. Wrap the post-success
+  increments in try/except and LOG (never re-raise) — the message is
+  already delivered; requeueing would double-send.
 - ONE Huey instance per process: `huey = RedisHuey("wms-huey", url=..., utc=False)`
   in `tasks/tasks.py`. Import chain: consumer imports `tasks.huey` →
   `tasks/__init__.py` re-exports `huey, send_whatsapp_message, get_job_status`
@@ -525,7 +528,10 @@ Completed so far:
 - **`QuotaService`** (`services/quota.py`) — per-user daily/monthly caps for
   messages vs OTPs (STRING records under `QUOTA:`, TTL lazy reset at each
   window's IST boundary), `check()` pre-send gate + `increment()` on
-  successful send, `set_limits` per user.
+  successful send, `set_limits` per user; **SYSTEM-WIDE super caps**
+  (`SYSTEM_DAILY_MESSAGES` / `SYSTEM_DAILY_OTP` env) via `system_gate` /
+  `system_increment` on the special `QUOTA:DAILY:SYSTEM` record — enforced
+  in every send task AFTER the per-user gate.
 - `models/` layer with `TaskStatus`, `OTPData`, and domain enums
   (`OTPStatus`, `WhatsappMessageType`).
 - **Phase 2 partially done**: send + store + verify_otp backend flow.

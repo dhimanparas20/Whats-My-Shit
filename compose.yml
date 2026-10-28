@@ -70,7 +70,7 @@ services:
         "CMD-SHELL",
         "python -c \"import os,sys; import redis; r=redis.Redis.from_url(os.getenv('REDIS_URL')); sys.exit(0 if r.ping() else 1)\""
       ]
-      interval: 3m
+      interval: 5m
       timeout: 5s
       retries: 3
       start_period: 10s

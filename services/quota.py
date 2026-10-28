@@ -23,11 +23,16 @@ from datetime import datetime, timedelta
 
 from configs import get_redis_str, get_settings
 from models import QuotaUsage, QuotaWindow, WhatsappMessageType
-from modules import get_logger
+from modules import get_logger, get_timestamp
 from modules.generics import IST, now_ist
+from modules.redis_util import RedisHashUtil, RedisStringUtil
 
 
 logger = get_logger(__name__, show_time=True)
+
+# SYSTEM-WIDE quota subject — every user's successful send counts here.
+# Keys: QUOTA:DAILY:SYSTEM (scannable, same machinery as user records).
+SYSTEM_SUBJECT = "SYSTEM"
 
 # Default caps — adjust here until plans/limits become user-configurable
 # (Phase 5). Per-user overrides via set_limits().
@@ -168,8 +173,8 @@ class QuotaService:
 
     def check(self, user_id: str, message_type: WhatsappMessageType) -> dict:
         """
-        Pre-send gate (API layer calls this before enqueueing; does NOT
-        mutate counters). Checks BOTH windows — a send is allowed only if
+        Per-user pre-send gate (API layer calls this before enqueueing; does
+        NOT mutate counters). Checks BOTH windows — a send is allowed only if
         it fits the daily AND the monthly cap.
         """
         daily = self.get_or_create(user_id, QuotaWindow.DAILY)
@@ -182,7 +187,22 @@ class QuotaService:
             ),
             "daily": daily.usage(message_type),
             "monthly": monthly.usage(message_type),
+            "scope": "user",
         }
+
+    @staticmethod
+    def _count_send(record: QuotaUsage, message_type: WhatsappMessageType, amount: int, now_ts: float) -> None:
+        """Bump counters + stamps for one send on an existing record."""
+        if message_type is WhatsappMessageType.TEXT:
+            if not record.first_message_sent_at:
+                record.first_message_sent_at = now_ts
+            record.last_message_sent_at = now_ts
+            record.messages_sent += amount
+        else:  # OTP
+            if not record.first_otp_sent_at:
+                record.first_otp_sent_at = now_ts
+            record.last_otp_sent_at = now_ts
+            record.otp_sent += amount
 
     def increment(
         self,
@@ -200,19 +220,56 @@ class QuotaService:
         now_ts = datetime.now(IST).timestamp()
         for window in (QuotaWindow.DAILY, QuotaWindow.MONTHLY):
             rec = self.get_or_create(user_id, window)
-            if message_type is WhatsappMessageType.TEXT:
-                if not rec.first_message_sent_at:
-                    rec.first_message_sent_at = now_ts
-                rec.last_message_sent_at = now_ts
-                rec.messages_sent += amount
-            else:  # OTP
-                if not rec.first_otp_sent_at:
-                    rec.first_otp_sent_at = now_ts
-                rec.last_otp_sent_at = now_ts
-                rec.otp_sent += amount
+            self._count_send(rec, message_type, amount, now_ts)
             self._write(rec)
             out[window.value] = rec.usage(message_type)
         return out
+
+    def system_gate(self, message_type: WhatsappMessageType) -> dict:
+        """
+        SYSTEM-WIDE super-cap gate (AGENTS §8): daily totals across ALL users.
+        Runs BEFORE every send; a block is terminal for that attempt.
+        """
+        dm, do = self._system_caps()
+        daily = self.get_or_create(
+            SYSTEM_SUBJECT, QuotaWindow.DAILY,
+            messages_limit=dm, otp_limit=do,
+        )
+        allowed = daily.allows(message_type)
+        used = daily.usage(message_type)
+        return {
+            "allowed": allowed,
+            "reason": None if allowed else (
+                "system daily messages cap exhausted"
+                if message_type is WhatsappMessageType.TEXT
+                else "system daily OTP cap exhausted"
+            ),
+            "daily": used,
+            "scope": "system",
+        }
+
+    def system_increment(
+        self,
+        message_type: WhatsappMessageType,
+        amount: int = 1,
+    ) -> dict:
+        """
+        Count a successful send toward the SYSTEM-WIDE daily total.
+        Call ONLY on successful sends (mirrors ``increment``).
+        """
+        dm, do = self._system_caps()
+        rec = self.get_or_create(
+            SYSTEM_SUBJECT, QuotaWindow.DAILY,
+            messages_limit=dm, otp_limit=do,
+        )
+        self._count_send(rec, message_type, amount, datetime.now(IST).timestamp())
+        self._write(rec)
+        return rec.usage(message_type)
+
+    def _system_caps(self) -> tuple[int, int]:
+        """System caps from SystemQuotaSettings (env-refreshed on restart)."""
+        s = get_settings().system
+        return s.daily_messages, s.daily_otp
 
     def set_limits(
         self,

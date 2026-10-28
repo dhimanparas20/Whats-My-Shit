@@ -78,6 +78,21 @@ class OTPSettings(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="otp_", env_file=ENV_FILE, extra="ignore")
 
+class SystemQuotaSettings(BaseSettings):
+    """
+    SYSTEM-WIDE daily caps — the super cap across ALL users.
+
+    Independent of per-user quotas: when the system total for a window is
+    exhausted, NO user can send (even under their own cap) until the window
+    resets. Env keys: SYSTEM_DAILY_MESSAGES / SYSTEM_DAILY_OTP.
+    """
+
+    daily_messages: int = 1000
+    daily_otp: int = 200
+
+    model_config = SettingsConfigDict(env_prefix="system_", env_file=ENV_FILE, extra="ignore")
+
+
 class RedisKeys(BaseSettings):
     huey_task_tracker: str = "HUEY_TASK_TRACKER"
     otp: str = "OTP"
@@ -99,6 +114,7 @@ class Settings(BaseSettings):
     api: FastAPISettings = FastAPISettings()
     task: TaskSettings = TaskSettings()
     otp: OTPSettings = OTPSettings()
+    system: SystemQuotaSettings = SystemQuotaSettings()
     redis_keys: RedisKeys = RedisKeys()  # users → "USER" (POSIX $USER collision renamed)
     # ^ RedisKeys.users → "USER" (renamed from `user`: POSIX $USER collision)
     # ^ RedisKeys.quota → "QUOTA" (quota tracking prefix — see services/quota.py)

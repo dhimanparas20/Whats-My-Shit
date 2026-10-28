@@ -178,9 +178,11 @@ case-insensitively against `configs/config.py` field names + prefixes.
 | `OTP_LENGTH` | `6` | OTP tasks | Code length in digits (4–12) |
 | `OTP_MAX_VERIFY_ATTEMPTS` | `5` | `verify_otp` | Wrong-code tries before lockout |
 | `HUEY_TASK_TRACKER` | `HUEY_TASK_TRACKER` | tasks | Redis key prefix for task-status records |
-| `OTP` | `OTP` | OTP service | Redis key prefix for OTP records (`OTP:<cc><phone>`) |
+| `OTP` | `OTP` | OTP service | Redis key prefix for OTP records (`OTP:<user_id>:<cc><phone>`) |
 | `USERS` | `USER` | user service | Redis key prefix for user records + indexes (env var is `USERS` — `USER` collides with the POSIX login-name env var) |
 | `QUOTA` | `QUOTA` | quota service | Redis key prefix for usage records (`QUOTA:<DAILY\|MONTHLY>:<user_id>` — window first) |
+| `SYSTEM_DAILY_MESSAGES` | `1000` | system super cap | **System-wide** daily WhatsApp-message ceiling across ALL users (`QUOTA:DAILY:SYSTEM`) |
+| `SYSTEM_DAILY_OTP` | `200` | system super cap | **System-wide** daily OTP ceiling across ALL users |
 | `LOG_LEVEL` | `DEBUG` | logger | stdlib levels |
 | `LOG_FORMAT` | `json` | logger | `json` or pretty |
 

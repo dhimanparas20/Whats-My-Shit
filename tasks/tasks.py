@@ -33,7 +33,7 @@ from models import TaskStatus, WhatsappMessageType, WAHASendResult
 from modules import get_logger, get_timestamp
 from services.otp import otp_service
 from services.quota import quota_service
-from services.tracking import quota_gate, tracker_key, task_tracker
+from services.tracking import quota_gate, system_gate, tracker_key, task_tracker
 
 
 logger = get_logger(__name__, show_time=True)
@@ -100,6 +100,9 @@ def send_whatsapp_message(
     blocked = quota_gate(user_id, WhatsappMessageType.TEXT, job_id, task)
     if blocked is not None:
         return blocked.model_dump()  # terminal — no raise, no retry
+    blocked = system_gate(user_id, WhatsappMessageType.TEXT, job_id, task)
+    if blocked is not None:
+        return blocked.model_dump()  # system super-cap — terminal, no retry
 
     try:
         waha = get_waha()
@@ -142,6 +145,7 @@ def send_whatsapp_message(
     # task (the message is ALREADY sent — a retry would double-send).
     try:
         quota_service.increment(user_id, WhatsappMessageType.TEXT)
+        quota_service.system_increment(WhatsappMessageType.TEXT)
     except Exception as inc_err:
         logger.error(
             f"QUOTA increment FAILED after successful send: user={user_id}, "
@@ -185,6 +189,9 @@ def send_whatsapp_otp(
     blocked = quota_gate(user_id, WhatsappMessageType.OTP, job_id, task)
     if blocked is not None:
         return blocked.model_dump()  # terminal — no raise, no retry
+    blocked = system_gate(user_id, WhatsappMessageType.OTP, job_id, task)
+    if blocked is not None:
+        return blocked.model_dump()  # system super-cap — terminal, no retry
 
     raw_otp, record = otp_service.generate(phone, otp_length, otp_ttl)
 
@@ -236,6 +243,7 @@ def send_whatsapp_otp(
     try:
         otp_service.save(record, user_id=user_id, country_code=country_code)
         quota_service.increment(user_id, WhatsappMessageType.OTP)
+        quota_service.system_increment(WhatsappMessageType.OTP)
     except Exception as post_err:
         logger.error(
             f"POST-SAVE FAILED after successful OTP send: user={user_id}, "

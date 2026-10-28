@@ -7,6 +7,7 @@ from services.otp import OTPService, otp_service, verify_otp
 from services.quota import QuotaService, quota_service
 from services.tracking import (
     quota_gate,
+    system_gate,
     task_tracker,
     tracker_key,
     write_status,
@@ -22,6 +23,7 @@ __all__ = [
     "UserService",
     "user_service",
     "quota_gate",
+    "system_gate",
     "task_tracker",
     "tracker_key",
     "write_status",

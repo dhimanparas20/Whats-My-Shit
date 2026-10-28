@@ -44,6 +44,32 @@ def write_status(user_id: str, job_id: str, status: TaskStatus) -> None:
     )
 
 
+def _blocked_and_write(
+    user_id: str, verdict: dict, message_type: WhatsappMessageType,
+    job_id: str, task,
+) -> TaskStatus:
+    """Build the terminal blocked TaskStatus + persist it to the tracker."""
+    blocked = TaskStatus(
+        job_id=job_id,
+        success=False,
+        result={
+            "error": verdict["reason"],
+            "quota_blocked": True,
+            "scope": verdict["scope"],
+        },
+        timestamp=get_timestamp(),
+        message_type=message_type,
+        extra_info={
+            "user_id": user_id,
+            "retries_left": task.retries,
+            "quota": verdict,
+            "error": verdict["reason"],
+        },
+    )
+    write_status(user_id, job_id, blocked)
+    return blocked
+
+
 def quota_gate(
     user_id: str,
     message_type: WhatsappMessageType,
@@ -51,7 +77,7 @@ def quota_gate(
     task,
 ) -> TaskStatus | None:
     """
-    Pre-send quota gate for a send task.
+    Pre-send quota gate (per-user).
 
     Returns ``None`` when the send is allowed (task proceeds), or a BLOCKED
     ``TaskStatus`` (already written to the tracker) when over limit. The
@@ -65,20 +91,29 @@ def quota_gate(
 
     logger.warning(
         f"Send BLOCKED by quota: user={user_id}, type={message_type.value}, "
-        f"reason={verdict['reason']}"
+        f"reason={verdict['reason']}, usage={verdict['daily']}"
     )
-    blocked = TaskStatus(
-        job_id=job_id,
-        success=False,
-        result={"error": verdict["reason"], "quota_blocked": True},
-        timestamp=get_timestamp(),
-        message_type=message_type,
-        extra_info={
-            "user_id": user_id,
-            "retries_left": task.retries,
-            "quota": verdict,
-            "error": verdict["reason"],
-        },
+    return _blocked_and_write(user_id, verdict, message_type, job_id, task)
+
+
+def system_gate(
+    user_id: str,
+    message_type: WhatsappMessageType,
+    job_id: str,
+    task,
+) -> TaskStatus | None:
+    """
+    SYSTEM-WIDE super-cap gate — shared daily total across ALL users.
+
+    Runs AFTER the per-user gate. Even users with personal quota remaining
+    are blocked once the system cap is exhausted; the block is terminal
+    (same no-raise contract) and the usage snapshot is logged + attached.
+    """
+    verdict = quota_service.system_gate(message_type)
+    if verdict["allowed"]:
+        return None
+    logger.warning(
+        f"Send BLOCKED by SYSTEM quota: user={user_id}, type={message_type.value}, "
+        f"reason={verdict['reason']}, usage={verdict['daily']}"
     )
-    write_status(user_id, job_id, blocked)
-    return blocked
+    return _blocked_and_write(user_id, verdict, message_type, job_id, task)
