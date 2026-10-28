@@ -17,6 +17,7 @@ in the SAME session, side by side with the code change:
 - Added/changed a **settings class, env var, or default** → update §3 of this
   file AND the env table in `README.md` AND `.env.sample`.
 - Added/changed a **client getter / singleton** → update §4 and `configs/clients.py` docstring header.
+- Added/changed a **service** → update §5a (services table) and `services/__init__.py` re-exports.
 - Added/changed a **model** (Pydantic) → update §6 module reference.
 - Added/changed a **task** → update §8 (Huey conventions) and README feature list.
 - Added/changed a **container, volume, healthcheck, or build step** → update §9.
@@ -62,8 +63,8 @@ Mental model — strictly ordered layers, dependencies only point downward
 (left → right):
 
 ```
-api/ (FastAPI)  →  tasks/ (Huey)  →  configs/  →  modules/
-                       models/          └────── modules/
+api/ (FastAPI)  →  tasks/ (Huey)  →  services/  →  configs/  →  modules/
+                       models/          └─────────────┘
 ```
 
 | Layer | Directory | What belongs there | What does NOT belong there |
@@ -72,9 +73,10 @@ api/ (FastAPI)  →  tasks/ (Huey)  →  configs/  →  modules/
 | **Clients** | `configs/clients.py` | `get_*()` singletons: raw redis, `RedisStringUtil`/`RedisHashUtil` wrappers, WAHA client, (future: HTTP clients) | business logic, raw env access |
 | **Re-exports** | `configs/__init__.py` | public surface: `from configs import get_settings, get_waha, ...` | new classes |
 | **Generic utils** | `modules/` | pure, project-agnostic helpers (logging, datetime, redis utils, WAHA client util) | app-specific business logic |
-| **Pydantic models** | `models/` | request/response models, domain records (e.g. `TaskStatus`), re-exported from `models/__init__.py` | redis I/O, direct calls to clients |
-| **Tasks** | `tasks/` | Huey instance + task functions + `get_job_status()` | API models rotated through API |
-| **API** | `api/` | FastAPI routers/endpoints, dependencies, auth, webhook receivers (planned; empty now) | sending logic (enqueue only) |
+| **Pydantic models** | `models/` | request/response models, domain records (e.g. `TaskStatus`, `OTPData`), domain enums (`models/enums.py`), re-exported from `models/__init__.py` | redis I/O, direct calls to clients |
+| **Services** | `services/` | domain/business logic spanning multiple Redis stores/prefixes or with lifecycle rules — state machines, cooldowns, rate limits (e.g. `OTPService`). Classes with module-level singletons | huey decorators, enqueueing; importing from tasks/api (cycles) |
+| **Tasks** | `tasks/` | Huey instance + THIN task functions (send → track → raise) + `get_job_status()` | business/domain logic — delegate to services |
+| **API** | `api/` | FastAPI routers/endpoints, dependencies, auth, webhook receivers (planned; empty now) | sending logic (enqueue only); call services/tasks |
 | **Tests** | *(not yet created)* | pytest tests mirroring the layer layout | — |
 
 **Placement checklists:**
@@ -96,6 +98,14 @@ api/ (FastAPI)  →  tasks/ (Huey)  →  configs/  →  modules/
    imports `tasks.huey` via `tasks/__init__.py`).
 3. Import-time side-effect: tasks module instantiates `huey` and db clients —
    keep it import-safe (no network literal calls needed at import).
+
+*New service need?*
+1. `services/<domain>.py` — business logic spanning multiple stores/prefixes
+   or with lifecycle rules. Class-based with a module-level singleton
+   (`otp_service = OTPService()`), like client getters.
+2. Re-export the class + singleton from `services/__init__.py`.
+3. Services import configs/modules/models ONLY — never tasks/api (import
+   cycles). Tasks and api import services downward.
 
 *New model need?*
 1. `models/<domain>.py` with a module docstring.
@@ -174,7 +184,17 @@ class-style (`RedisHashUtil.generate_random_number(6)`), never via a
 
 ---
 
-## §5. Module Reference (`modules/`)
+## §5a. Services (`services/`)
+
+Business-logic layer (AGENTS §2) — domain logic spanning multiple Redis
+stores/prefixes or with lifecycle rules. Classes with module-level singletons;
+import from `services` re-exports, never tasks/api cycles.
+
+| File | Service | Key API |
+|---|---|---|
+| `services/otp.py` | `OTPService` (singleton `otp_service`) | `generate(phone, length?, ttl?)` → `(plaintext, OTPData)`; `save(record, phone, country_code?)`; `get(phone, country_code?)` → `OTPData\|None`; `delete(...)`; **`verify_otp(phone, code, country_code?)` — classmethod** (routes through the singleton's store/settings, overridable; callable as `OTPService.verify_otp(...)`, `otp_service.verify_otp(...)`, or flat `verify_otp` alias). Owns: pepper (warn-once), `OTP:<cc><phone>` keying, one-active-code-per-phone, attempt counting/lockout, expiry reclaim |
+
+## §5b. Module Reference (`modules/`)
 
 | File | Purpose | Key API |
 |---|---|---|
@@ -224,6 +244,13 @@ class-style (`RedisHashUtil.generate_random_number(6)`), never via a
   and `WhatsappMessageType` (text/otp). **Enums live in models, NOT configs** —
   configs must never import from models (layering), so never resurrect
   `configs/enums.py`.
+- `WAHASendResult` (models/waha.py) — normalized WAHA send response
+  (`resp['_data']`): fields `from_` (alias `"from"` — reserved keyword),
+  `to`, `viewed`, `id` (str OR dict-with-`_serialized`). Build via
+  `WAHASendResult.from_waha(resp)`; serialize with
+  `model_dump(by_alias=True)` so JSON keys stay WAHA-original. Extra payload
+  keys ignored; missing required keys → ValidationError (task's except
+  treats it as send failure).
 - Always re-export from `models/__init__.py`. Task/API import as
   `from models import TaskStatus` — never `from models.tasks import ...`.
 - Convention: models are pure data + validation, type-only deps (pydantic);
@@ -243,26 +270,32 @@ class-style (`RedisHashUtil.generate_random_number(6)`), never via a
 - Always mutate via `task_tracker.set(... overwrite=True)` — retries re-run the
   same job_id and must overwrite the previous attempt's entry.
 
-**OTP (Phase 2 core, implemented):**
+**OTP (Phase 2 core, implemented — logic lives in `services/otp.py`):**
 - Redis key: `OTP:<country_code><phone>` (e.g. `OTP:919876543210`) — one
   ACTIVE code per phone; retries and re-requests overwrite with
   `overwrite=True` and an explicit per-key `ttl=otp_ttl` (never the caller's
   12h store default).
-- `send_whatsapp_otp(task)`: generate code → HMAC-SHA256 with
-  `OTPSettings.pepper` → send via WAHA → **store the OTP record ONLY after the
-  send succeeds** (a never-delivered code must never verify). Plaintext code:
-  never logged, never stored.
-- `verify_otp(phone, code)` (sync helper in tasks/tasks.py): resolution order
-  not_found → terminal (verified/failed) → expired (deletes record) →
-  attempts exhausted (locks, status FAILED) → HMAC-compare via
-  `hmac.compare_digest` → success / wrong_code (+attempts). Every mutation
-  rewrite re-claims the remaining TTL so records cannot outlive expiry.
+- `OTPService.generate(phone, ...)` → `(plaintext, record)`; the task sends
+  via WAHA, then `otp_service.save(record, phone, country_code)` — **the
+  record persists ONLY after the send succeeds** (a never-delivered code must
+  never verify). Plaintext code: never logged, never stored.
+- `verify_otp(phone, code)` — classmethod on `OTPService` (services/otp.py,
+  flat alias re-exported from tasks for compat): resolution order not_found →
+  terminal (verified/failed) → expired (deletes record) → attempts exhausted
+  (locks, status FAILED) → HMAC-compare via `hmac.compare_digest` →
+  success / wrong_code (+attempts). Every mutation rewrite re-claims the
+  remaining TTL so records cannot outlive expiry.
 - `TaskStatus.extra_info` carries `otp_id` (uuid7) — never the code.
 - **Not yet built (next up in Phase 2):** resend cooldown/rate limiting,
-  verify endpoint in `api/`, fractionated TTL strategy.
+  verify endpoint in `api/`.
 
 ## §8. Huey Rules
 
+- **Tasks stay THIN**: send via WAHA → write TaskStatus → raise on failure.
+  ALL domain logic (generation, storage rules, state machines, multi-store
+  flows) belongs in `services/` — import as
+  `from services.otp import otp_service`. Services must NEVER import tasks
+  (import cycles); tasks import services downward.
 - ONE Huey instance per process: `huey = RedisHuey("wms-huey", url=..., utc=False)`
   in `tasks/tasks.py`. Import chain: consumer imports `tasks.huey` →
   `tasks/__init__.py` re-exports `huey, send_whatsapp_message, get_job_status`
@@ -348,8 +381,8 @@ class-style (`RedisHashUtil.generate_random_number(6)`), never via a
 11. Python is pinned to 3.14 in `.python-version` and `pyproject.toml` —
     — verify before bumping.
 12. Docker volume bind-mount dirs validated: `./modules`, `./configs`,
-    `./models`, `./tasks`, `.ipython` — adding an app dir means editing
-    compose volumes (no bake) or Dockerfile COPY (bake).
+    `./models`, `./tasks`, `./services`, `.ipython` — adding an app dir means
+    editing compose volumes (no bake) or Dockerfile COPY (bake).
 13. `RedisStringUtil` and `RedisHashUtil` are SIBLINGS, not parent/child:
     crypto statics (`generate_random_number`, `generate_uuid7`,
     `hash_sensitive_data`, `hash_sensitive_data_hmac`) exist ONLY on
@@ -372,7 +405,8 @@ class-style (`RedisHashUtil.generate_random_number(6)`), never via a
 ```bash
 # local sanity (host, repo root):
 .venv/bin/python -c "from configs import get_settings; s=get_settings(); print(s.redis.redis_url, s.waha.api_url, s.task)"
-.venv/bin/python -c "from tasks import huey, send_whatsapp_message; print(type(huey).__name__)"
+.venv/bin/python -c "from tasks import huey, send_whatsapp_message, send_whatsapp_otp, verify_otp; print(type(huey).__name__)"
+.venv/bin/python -c "from services import otp_service, OTPService; print(type(otp_service).__name__)"
 
 # container:
 docker compose up -d --build huey
@@ -397,7 +431,10 @@ Completed so far:
   client, huge Redis toolkit).
 - Huey pipeline: `send_whatsapp_message` (text) and `send_whatsapp_otp` (code
   generation + HMAC hashing + Redis record) with retries + TaskStatus
-  tracker + `get_job_status()`; `verify_otp()` helper.
+  tracker + `get_job_status()`.
+- **`services/` layer** — `OTPService` (`services/otp.py`) owns the whole OTP
+  lifecycle (generate/save/get/delete/verify); tasks are thin wrappers;
+  `verify_otp` re-exported from both `services` and `tasks`.
 - `models/` layer with `TaskStatus`, `OTPData`, and domain enums
   (`OTPStatus`, `WhatsappMessageType`).
 - **Phase 2 partially done**: send + store + verify_otp backend flow.
@@ -431,4 +468,4 @@ Next phases (update README + this section as they land):
 - Grep whole repo for old names (`api_key=` misuse, old env names, old prefix).
 - Restart the relevant container (code is volume-mounted; no rebuild needed for
   python code, restart only for env/entrypoint changes).
-- Update §5, §6, §8, §12, §13 and README per Rule 0.1.
+- Update §5a, §5b, §6, §8, §12, §13 and README per Rule 0.1.

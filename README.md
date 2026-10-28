@@ -179,9 +179,10 @@ case-insensitively against `configs/config.py` field names + prefixes.
 ├── configs/        BaseSettings classes + client singletons (get_* + lru_cache)
 │   ├── config.py     .env → typed Settings (one class per domain, env_prefix)
 │   └── clients.py    get_redis / get_redis_str / get_redis_hash / get_waha
-├── models/         Pure Pydantic models (TaskStatus, OTPData) + domain enums
+├── models/         Pure Pydantic models (TaskStatus, OTPData, WAHASendResult) + domain enums
 ├── modules/        Generic utils: logger, IST time, Redis toolkit, WAHA client
-├── tasks/          Huey instance + task functions + get_job_status
+├── services/       Business logic: OTPService (generate/save/verify OTP lifecycle)
+├── tasks/          Huey instance + THIN task wrappers + get_job_status
 ├── api/            FastAPI routers (Phase 1 — currently empty)
 ├── compose.yml     waha + huey services with healthchecks
 ├── Dockerfile      Python 3.14-slim + uv sync (code is volume-mounted, dev)

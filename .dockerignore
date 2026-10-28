@@ -58,4 +58,4 @@ compose.override.yml
 README.md
 
 # Everything else isn't needed — but keep allowed:
-# KEEP: modules/, configs/, tasks/, api/, models/, pyproject.toml, uv.lock
+# KEEP: modules/, configs/, tasks/, api/, services/, models/, pyproject.toml, uv.lock

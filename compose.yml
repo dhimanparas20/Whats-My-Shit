@@ -57,6 +57,7 @@ services:
       - ./modules:/app/modules
       - ./configs:/app/configs
       - ./models:/app/models
+      - ./services:/app/services
       # Persist ipython profile (history.sqlite etc.) across rebuilds.
       # MUST be listed BEFORE the startup-file mount below, so the file
       # mount lands on top of the directory mount.
