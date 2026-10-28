@@ -66,8 +66,21 @@ class TaskSettings(BaseSettings):
 
     model_config = SettingsConfigDict(env_file=ENV_FILE, extra="ignore")
 
+class OTPSettings(BaseSettings):
+    """OTP generation/verification knobs — env keys OTP_* (env_prefix='otp_')."""
+
+    # Secret used as the HMAC key when hashing OTP codes. REQUIRED for
+    # production; empty default triggers a loud warning + insecure fallback.
+    pepper: str = ""
+    ttl: int = 30 * 60              # seconds an OTP stays valid
+    length: int = 6                 # digits (generate_random_number allows 4–12)
+    max_verify_attempts: int = 3    # wrong-code tries before the record is locked
+
+    model_config = SettingsConfigDict(env_prefix="otp_", env_file=ENV_FILE, extra="ignore")
+
 class RedisKeys(BaseSettings):
     huey_task_tracker: str = "HUEY_TASK_TRACKER"
+    otp: str = "OTP"
 
     model_config = SettingsConfigDict(env_file=ENV_FILE, extra="ignore")
 
@@ -79,6 +92,7 @@ class Settings(BaseSettings):
     waha: WASettings = WASettings()
     api: FastAPISettings = FastAPISettings()
     task: TaskSettings = TaskSettings()
+    otp: OTPSettings = OTPSettings()
     redis_keys: RedisKeys = RedisKeys()
 
     model_config = SettingsConfigDict(env_file=ENV_FILE, extra="ignore")

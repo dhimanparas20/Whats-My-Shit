@@ -65,6 +65,11 @@ marketing blasts.
 
 - ✅ **WhatsApp send pipeline** — `send_whatsapp_message` Huey task wrapping
   WAHA's `/sendText`, with configurable retries (`2` attempts / `60s` delay)
+- ✅ **WhatsApp OTP flow (Phase 2 core)** — `send_whatsapp_otp`: cryptographically
+  random code, HMAC-SHA256-hashed with an `OTP_PEPPER` secret (plaintext never
+  stored or logged), one active code per phone (`OTP:<country_code><phone>`),
+  per-key TTL, and `verify_otp()` with attempt counting, expiry handling and
+  lockout after `OTP_MAX_VERIFY_ATTEMPTS` wrong tries
 - ✅ **Task tracker** — every task records its terminal state
   (`TaskStatus` JSON) to Redis under `HUEY_TASK_TRACKER:<job_id>`; survives
   result-TTL expiry and is readable without touching Huey's pickle store
@@ -87,7 +92,7 @@ marketing blasts.
 ## Not here yet
 
 - ❌ HTTP API (`POST /messages`, status endpoint) — Phase 1, next up
-- ❌ OTP module — Phase 2
+- ❌ OTP cooldown / resend rate limiting + HTTP verify endpoint — remaining Phase 2 work
 - ❌ Inbound webhooks + delivery-tracking — Phase 3
 - ❌ Scheduled sends — Phase 4
 - ❌ API keys / user auth / quotas — Phase 5
@@ -149,6 +154,10 @@ case-insensitively against `configs/config.py` field names + prefixes.
 | `WAHA_SESSION` | `default` | WAHA client | Which session to send through |
 | `WAHA_DEFAULT_COUNTRY_CODE` | `91` | WAHA client | Prefix for bare phone numbers |
 | `API_DEBUG` / `API_PORT` / `API_HOST` | `false` / `8000` / `0.0.0.0` | FastAPI (Phase 1) | Reserved |
+| `OTP_PEPPER` | *(empty)* | OTP tasks | HMAC secret for hashing codes — **required before real OTP traffic** |
+| `OTP_TTL` | `1800` | OTP tasks | Seconds a code stays valid |
+| `OTP_LENGTH` | `6` | OTP tasks | Code length in digits (4–12) |
+| `OTP_MAX_VERIFY_ATTEMPTS` | `5` | `verify_otp` | Wrong-code tries before lockout |
 | `HUEY_TASK_TRACKER` | `HUEY_TASK_TRACKER` | tasks | Redis key prefix for task-status records |
 | `LOG_LEVEL` | `DEBUG` | logger | stdlib levels |
 | `LOG_FORMAT` | `json` | logger | `json` or pretty |
@@ -170,7 +179,7 @@ case-insensitively against `configs/config.py` field names + prefixes.
 ├── configs/        BaseSettings classes + client singletons (get_* + lru_cache)
 │   ├── config.py     .env → typed Settings (one class per domain, env_prefix)
 │   └── clients.py    get_redis / get_redis_str / get_redis_hash / get_waha
-├── models/         Pure Pydantic models (TaskStatus), re-exported in __init__
+├── models/         Pure Pydantic models (TaskStatus, OTPData) + domain enums
 ├── modules/        Generic utils: logger, IST time, Redis toolkit, WAHA client
 ├── tasks/          Huey instance + task functions + get_job_status
 ├── api/            FastAPI routers (Phase 1 — currently empty)
@@ -216,8 +225,8 @@ docker exec -it wms-huey-1 bash                   # then: ipython  ('r' = redis 
 - [x] Docker: WAHA + huey with healthchecks, IPython dev loop, `.dockerignore`
 - [ ] **Phase 1 — Core send API**: `POST /messages` (idempotency-Key),
       `GET /messages/{id}` via `get_job_status`, message persistence
-- [ ] **Phase 2 — OTP**: hashed-code generation with TTL, cooldown, verify
-      endpoint, rate limiting
+- [ ] **Phase 2 — OTP**: ✅ send (hashed, peppered) + `verify_otp()` with
+      attempts/lockout/expiry — cooldown & rate limiting + HTTP endpoints remain
 - [ ] **Phase 3 — Inbound webhooks + delivery tracking**: WAHA HMAC-verified
       receiver, message-ack correlation, `session.status` auto-restart
 - [ ] **Phase 4 — Scheduling**: `send_at` (ISO or natural language), cancel,

@@ -121,9 +121,13 @@ api/ (FastAPI)  →  tasks/ (Huey)  →  configs/  →  modules/
   - `FastAPISettings` — `env_prefix="api_"` — `API_DEBUG`, `API_PORT`, `API_HOST`
   - `TaskSettings` — no prefix yet (defaults `retry_count=2`, `delay=60`; consider
     `env_prefix="task_"` if growing)
+  - `OTPSettings` — `env_prefix="otp_"` — `OTP_PEPPER` (HMAC secret, REQUIRED
+    for prod; empty default logs a loud warning + insecure dev fallback),
+    `OTP_TTL` (1800s), `OTP_LENGTH` (6), `OTP_MAX_VERIFY_ATTEMPTS` (5)
   - `RedisKeys` — configured key-name constants (e.g. `huey_task_tracker="HUEY_TASK_TRACKER"`)
 - Aggregate: `Settings` holds typed instances (`redis: RedisSettings`, `waha: WASettings`, …).
 - Access: `get_settings()` — `@lru_cache` — call freely; never construct `Settings()` ad-hoc.
+  Aggregate fields: `redis`, `waha`, `api`, `task`, `otp`, `redis_keys`.
 - Env names match `env_prefix + fieldname` **case-insensitively** (`redis_url` ← `REDIS_URL`).
 
 **Purpose of `WAHA_API_URL` vs `WAHA_BASE_URL` (do not mix):**
@@ -154,9 +158,19 @@ All external connections are built here. **Rules:**
 
 **Named stores in use (via `get_redis_str`/`get_redis_hash`):**
 - `HUEY_TASK_TRACKER` prefix — `TaskStatus` records (§7).
-- `WMS:*` namespaces reserved for future use (OTP store, idempotency).
+- `OTP:<country_code><phone>` prefix (one STRING per phone, `TaskSettings`-independent
+  per-key TTL) — `OTPData` records (§7).
+- `WMS:*` namespaces reserved for future use (idempotency).
 - CONVENTION: all new Redis keys use `UPPER_SNAKE` or `WMS:<SUB>:<ID>` prefixes,
   IDs are UUID4 from huey/str(uuid4).
+
+⚠️ **Careful with which util class has which static helpers:** the pure crypto
+helpers (`generate_random_number` for OTPs, `generate_uuid7`,
+`hash_sensitive_data`, `hash_sensitive_data_hmac`, `hash_password`,
+`verify_password`) are static methods on `RedisHashUtil` ONLY —
+`RedisStringUtil` does NOT have them and does NOT inherit from it. Call them
+class-style (`RedisHashUtil.generate_random_number(6)`), never via a
+`get_redis_str()` instance, unless that module also defines them.
 
 ---
 
@@ -199,14 +213,25 @@ All external connections are built here. **Rules:**
 
 - `TaskStatus` (models/tasks.py) — record written to the task tracker. Fields:
   `job_id`, `success` (default True), `result: dict|None`, `timestamp: float`,
-  `extra_info: dict|None`. Class factories `TaskStatus.finished(...)`,
-  `TaskStatus.failed(...)`.
-- Always re-export from `models/__init__.py`. Task/API import as `from models import TaskStatus`.
+  `extra_info: dict|None`, `message_type: WhatsappMessageType|None`. Class
+  factories `TaskStatus.finished(...)`, `TaskStatus.failed(...)`.
+- `OTPData` (models/tasks.py) — per-phone OTP record (§7). Fields: `otp_id`
+  (uuid7), `hashed_otp` (HMAC-SHA256 of the code), `phone`, `timestamp`,
+  `status` (OTPStatus, default PENDING), `attempts`, `retry_count`,
+  `ttl`, `expiry` (auto = timestamp+ttl via model_validator), `extra_info`.
+  Instance helpers: `remaining_ttl()`, `is_expired()` (note: NOT a classmethod).
+- `models/enums.py` — domain enums `OTPStatus` (pending/verified/expired/failed)
+  and `WhatsappMessageType` (text/otp). **Enums live in models, NOT configs** —
+  configs must never import from models (layering), so never resurrect
+  `configs/enums.py`.
+- Always re-export from `models/__init__.py`. Task/API import as
+  `from models import TaskStatus` — never `from models.tasks import ...`.
 - Convention: models are pure data + validation, type-only deps (pydantic);
   NO redis/requests imports.
 
-## §7. Task Tracker Pattern (Redis)
+## §7. Task Tracker & OTP Patterns (Redis)
 
+**Task tracker:**
 - Redis key: `HUEY_TASK_TRACKER:<job_id>` (one STRING with JSON `TaskStatus`).
 - Written by the task itself just before returning/re-raising, so it only
   reflects terminal states; pending/queued lookup falls back to huey.
@@ -217,6 +242,24 @@ All external connections are built here. **Rules:**
   4. else `not_found`
 - Always mutate via `task_tracker.set(... overwrite=True)` — retries re-run the
   same job_id and must overwrite the previous attempt's entry.
+
+**OTP (Phase 2 core, implemented):**
+- Redis key: `OTP:<country_code><phone>` (e.g. `OTP:919876543210`) — one
+  ACTIVE code per phone; retries and re-requests overwrite with
+  `overwrite=True` and an explicit per-key `ttl=otp_ttl` (never the caller's
+  12h store default).
+- `send_whatsapp_otp(task)`: generate code → HMAC-SHA256 with
+  `OTPSettings.pepper` → send via WAHA → **store the OTP record ONLY after the
+  send succeeds** (a never-delivered code must never verify). Plaintext code:
+  never logged, never stored.
+- `verify_otp(phone, code)` (sync helper in tasks/tasks.py): resolution order
+  not_found → terminal (verified/failed) → expired (deletes record) →
+  attempts exhausted (locks, status FAILED) → HMAC-compare via
+  `hmac.compare_digest` → success / wrong_code (+attempts). Every mutation
+  rewrite re-claims the remaining TTL so records cannot outlive expiry.
+- `TaskStatus.extra_info` carries `otp_id` (uuid7) — never the code.
+- **Not yet built (next up in Phase 2):** resend cooldown/rate limiting,
+  verify endpoint in `api/`, fractionated TTL strategy.
 
 ## §8. Huey Rules
 
@@ -307,6 +350,22 @@ All external connections are built here. **Rules:**
 12. Docker volume bind-mount dirs validated: `./modules`, `./configs`,
     `./models`, `./tasks`, `.ipython` — adding an app dir means editing
     compose volumes (no bake) or Dockerfile COPY (bake).
+13. `RedisStringUtil` and `RedisHashUtil` are SIBLINGS, not parent/child:
+    crypto statics (`generate_random_number`, `generate_uuid7`,
+    `hash_sensitive_data`, `hash_sensitive_data_hmac`) exist ONLY on
+    `RedisHashUtil`. Calling `otp_store.generate_random_number(...)` on a
+    string util raises `AttributeError` at runtime.
+14. Pydantic class-body defaults are evaluated ONCE at class definition:
+    `expiry: float = timestamp + ttl` silently becomes `0.0 + 3600`. Compute
+    cross-field defaults in a `@model_validator(mode="after")`, never in
+    field defaults, and never override BaseModel `__init__` for it.
+15. Domain enums live in `models/enums.py` (NOT `configs/enums.py`) — configs
+    must not import from models. Import as `from models import OTPStatus`.
+16. OTP pepper (`RedisKeys.otp` etc.) is a KEY NAME, not a secret — hashing
+    with it is false security. Use `OTPSettings.pepper` (OTP_PEPPER env).
+17. OTP failure contract subtlety: store the OTP record AFTER a successful
+    send only — otherwise failed attempts persist verifiable codes the user
+    never received, and uuid7-per-attempt orphans keys on every retry.
 
 ## §12. Testing / sanity commands used in this codebase
 
@@ -336,11 +395,14 @@ Completed so far:
 - Client singletons (raw redis, string/hash util wrappers, WAHA).
 - General utils (logger w/ redaction, IST helpers, dateparser tz util, WAHA
   client, huge Redis toolkit).
-- Huey pipeline: `send_whatsapp_message` (text) with retries + TaskStatus
-  tracker + `get_job_status()`.
+- Huey pipeline: `send_whatsapp_message` (text) and `send_whatsapp_otp` (code
+  generation + HMAC hashing + Redis record) with retries + TaskStatus
+  tracker + `get_job_status()`; `verify_otp()` helper.
+- `models/` layer with `TaskStatus`, `OTPData`, and domain enums
+  (`OTPStatus`, `WhatsappMessageType`).
+- **Phase 2 partially done**: send + store + verify_otp backend flow.
 - Docker: WAHA + huey containers, healthchecks (waha /health w/ API key, huey
   redis ping), ipython-in-container dev loop, `.dockerignore`.
-- `models/` layer with `TaskStatus`.
 
 Next phases (update README + this section as they land):
 1. **Phase 1 — Core send via API**: `api/` FastAPI service; `POST /messages`
