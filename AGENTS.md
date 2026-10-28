@@ -134,7 +134,8 @@ api/ (FastAPI)  →  tasks/ (Huey)  →  services/  →  configs/  →  modules/
   - `OTPSettings` — `env_prefix="otp_"` — `OTP_PEPPER` (HMAC secret, REQUIRED
     for prod; empty default logs a loud warning + insecure dev fallback),
     `OTP_TTL` (1800s), `OTP_LENGTH` (6), `OTP_MAX_VERIFY_ATTEMPTS` (5)
-  - `RedisKeys` — configured key-name constants (e.g. `huey_task_tracker="HUEY_TASK_TRACKER"`)
+  - `RedisKeys` — configured key-name constants (e.g. `huey_task_tracker="HUEY_TASK_TRACKER"`,
+    `otp="OTP"`, `user="USER"`)
 - Aggregate: `Settings` holds typed instances (`redis: RedisSettings`, `waha: WASettings`, …).
 - Access: `get_settings()` — `@lru_cache` — call freely; never construct `Settings()` ad-hoc.
   Aggregate fields: `redis`, `waha`, `api`, `task`, `otp`, `redis_keys`.
@@ -193,6 +194,7 @@ import from `services` re-exports, never tasks/api cycles.
 | File | Service | Key API |
 |---|---|---|
 | `services/otp.py` | `OTPService` (singleton `otp_service`) | `generate(phone, length?, ttl?)` → `(plaintext, OTPData)`; `save(record, phone, country_code?)`; `get(phone, country_code?)` → `OTPData\|None`; `delete(...)`; **`verify_otp(phone, code, country_code?)` — classmethod** (routes through the singleton's store/settings, overridable; callable as `OTPService.verify_otp(...)`, `otp_service.verify_otp(...)`, or flat `verify_otp` alias). Owns: pepper (warn-once), `OTP:<cc><phone>` keying, one-active-code-per-phone, attempt counting/lockout, expiry reclaim |
+| `services/user.py` | `UserService` (singleton `user_service`) | Storage: `USER:<user_id>` HASH (uuid7, no TTL) + O(1) indexes `USER:EMAIL:<sha256(email)>` and `USER:APIKEY:<sha256(api_key)>` (STRING maps — PII/keys never in key names, never SCAN'd). API: `create(full_name, email, password, webhook_url?, extra_info?)` → `(User, plaintext_api_key)` — dup email raises, plaintext shown ONCE, only sha256 persisted; `get(id)`; `find_by_email(email)`; `authenticate_api_key(key)` (respects `is_active`); `authenticate(email, password)` (bcrypt `verify_password`); `update(id, **fields)` — whitelist `full_name/webhook_url/is_active/extra_info` only, stamps `updated_at`, raises on credential fields; `update_password(id, new)` — no old password required = forgot-password/reset primitive (API layer verifies identity via OTP/token first); `rotate_api_key(id)` → `(User, plaintext)` (old key dies instantly, index killed via stored hash — no plaintext needed); `delete(id)` (hard — indexes cleaned). Passwords = bcrypt; api keys = sha256 (see §11 pitfall 18) |
 
 ## §5b. Module Reference (`modules/`)
 
@@ -244,6 +246,14 @@ import from `services` re-exports, never tasks/api cycles.
   and `WhatsappMessageType` (text/otp). **Enums live in models, NOT configs** —
   configs must never import from models (layering), so never resurrect
   `configs/enums.py`.
+- `User` (models/user.py) — API consumer record (Phase 5 groundwork).
+  Fields: `user_id` (uuid7), `full_name`, `email` (regex-validated +
+  lowercased/stripped via validator; swap to `EmailStr` if/when
+  `email-validator` dep is added), `webhook_url` (Optional[HttpUrl]),
+  `api_key_hash` (sha256 of the key — PLAINTEXT KEY IS NEVER STORED,
+  shown once at create/rotate), `password_hash` (bcrypt — one-way, NOT
+  reversible encryption), `created_at`/`updated_at` (floats),
+  `is_active` (soft-disable), `extra_info`.
 - `WAHASendResult` (models/waha.py) — normalized WAHA send response
   (`resp['_data']`): fields `from_` (alias `"from"` — reserved keyword),
   `to`, `viewed`, `id` (str OR dict-with-`_serialized`). Build via
@@ -399,6 +409,17 @@ import from `services` re-exports, never tasks/api cycles.
 17. OTP failure contract subtlety: store the OTP record AFTER a successful
     send only — otherwise failed attempts persist verifiable codes the user
     never received, and uuid7-per-attempt orphans keys on every retry.
+18. Hash-algorithm asymmetry is INTENTIONAL: passwords → bcrypt (slow,
+    low-entropy human strings); API keys → sha256 (fast hot-path auth,
+    384-bit entropy makes brute force infeasible). Do NOT "fix" one to
+    match the other — bcrypt on every API request adds ~100ms; sha256 on
+    passwords is instant to brute-force.
+19. NEVER name a prefix-less settings field after a POSIX env var: the
+    `user` field in `RedisKeys` resolved to `$USER` (shell login name —
+    `paras` on this box) because real env vars beat defaults, so Redis
+    keys silently became `PARAS:…` and would have DIFFERED in containers
+    (`USER` unset → default). Renamed to `users` (env `USERS`). The danger
+    set: `user`, `path`, `home`, `shell`, `pwd`, `tmpdir`, `lang`, `term`.
 
 ## §12. Testing / sanity commands used in this codebase
 
@@ -435,6 +456,9 @@ Completed so far:
 - **`services/` layer** — `OTPService` (`services/otp.py`) owns the whole OTP
   lifecycle (generate/save/get/delete/verify); tasks are thin wrappers;
   `verify_otp` re-exported from both `services` and `tasks`.
+- **`UserService`** (`services/user.py`) — user accounts (uuid7 HASH records
+  under `USER:`), bcrypt passwords, `wms_`-prefixed API keys with O(1)
+  sha256-index auth lookups, rotation, soft-disable, delete.
 - `models/` layer with `TaskStatus`, `OTPData`, and domain enums
   (`OTPStatus`, `WhatsappMessageType`).
 - **Phase 2 partially done**: send + store + verify_otp backend flow.

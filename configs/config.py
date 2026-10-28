@@ -81,6 +81,10 @@ class OTPSettings(BaseSettings):
 class RedisKeys(BaseSettings):
     huey_task_tracker: str = "HUEY_TASK_TRACKER"
     otp: str = "OTP"
+    # Named `users` (NOT `user`): a prefix-less `user` field would match the
+    # standard POSIX $USER env var (login name) → keys differed per machine.
+    # Env key is USERS; the VALUE is the Redis key prefix (USER:<user_id>).
+    users: str = "USERS"
 
     model_config = SettingsConfigDict(env_file=ENV_FILE, extra="ignore")
 

@@ -70,6 +70,12 @@ marketing blasts.
   stored or logged), one active code per phone (`OTP:<country_code><phone>`),
   per-key TTL, and `verify_otp()` with attempt counting, expiry handling and
   lockout after `OTP_MAX_VERIFY_ATTEMPTS` wrong tries
+- ✅ **User service (Phase 5 groundwork)** — `UserService`: registration with
+  duplicate-email protection, bcrypt-hashed passwords, `wms_`-prefixed API
+  keys **stored only as sha256 hashes** (plaintext shown once at
+  create/rotation) with O(1) hashed-index lookups (ready for `X-Api-Key`
+  auth), key rotation, password reset (forgot-password primitive),
+  soft-disable (`is_active`), and clean deletes
 - ✅ **Task tracker** — every task records its terminal state
   (`TaskStatus` JSON) to Redis under `HUEY_TASK_TRACKER:<job_id>`; survives
   result-TTL expiry and is readable without touching Huey's pickle store
@@ -159,6 +165,8 @@ case-insensitively against `configs/config.py` field names + prefixes.
 | `OTP_LENGTH` | `6` | OTP tasks | Code length in digits (4–12) |
 | `OTP_MAX_VERIFY_ATTEMPTS` | `5` | `verify_otp` | Wrong-code tries before lockout |
 | `HUEY_TASK_TRACKER` | `HUEY_TASK_TRACKER` | tasks | Redis key prefix for task-status records |
+| `OTP` | `OTP` | OTP service | Redis key prefix for OTP records (`OTP:<cc><phone>`) |
+| `USER` | `USER` | user service | Redis key prefix for user records + indexes |
 | `LOG_LEVEL` | `DEBUG` | logger | stdlib levels |
 | `LOG_FORMAT` | `json` | logger | `json` or pretty |
 
@@ -179,7 +187,7 @@ case-insensitively against `configs/config.py` field names + prefixes.
 ├── configs/        BaseSettings classes + client singletons (get_* + lru_cache)
 │   ├── config.py     .env → typed Settings (one class per domain, env_prefix)
 │   └── clients.py    get_redis / get_redis_str / get_redis_hash / get_waha
-├── models/         Pure Pydantic models (TaskStatus, OTPData, WAHASendResult) + domain enums
+├── models/         Pure Pydantic models (TaskStatus, OTPData, User, WAHASendResult) + enums
 ├── modules/        Generic utils: logger, IST time, Redis toolkit, WAHA client
 ├── services/       Business logic: OTPService (generate/save/verify OTP lifecycle)
 ├── tasks/          Huey instance + THIN task wrappers + get_job_status

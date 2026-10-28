@@ -40,3 +40,4 @@ class WAHASendResult(BaseModel):
         ValidationError when required fields are absent.
         """
         return cls(**resp["_data"])
+
